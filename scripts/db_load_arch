@@ -1,0 +1,247 @@
+#!/usr/local/bin/tcl
+#!/usr/local/bin/tclsh9.0
+# Load newsgroup files (zipped mbox) from Internet Archive into database
+
+set over_db /data/news_over.db
+set arch_db /data2/news_archive.db
+set rejects /data3/rejects
+
+package require sqlite3
+package require mime
+
+sqlite3 overdb $over_db
+overdb timeout 60000
+
+sqlite3 archdb $arch_db
+archdb timeout 60000
+
+set max_dat [clock scan {1/1/2004}]
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+proc store_group group {
+    overdb eval {INSERT INTO groups(name) VALUES($group) ON CONFLICT DO NOTHING}
+    return [overdb eval {SELECT rowid FROM groups WHERE name == $group}]
+}
+
+proc load_art {art group} {
+    # If parsing fails, try various workarounds
+    if {! [catch {parse_art $art} err]} return
+    #set errstack [info errorstack]
+    puts "load_art FAILED: '$err'"
+
+    switch -regexp -matchvar matches $err {
+        {multiple Content-Type fields starting with (.*)$} {
+            lassign $matches - contype
+            set art2 [regsub -- "***=$contype\n" $art {}]
+        }
+        {Can't handle content encoding "(.*)"} {
+            lassign $matches - what
+            if {[regexp {8.?bit} $what]} {
+                set enc 8bit
+            } elseif {[regexp {7.?bit} $what]} {
+                set enc 7bit
+            } else {
+                lassign [split $what] enc
+            }
+            set map [list "Content-Transfer-Encoding: $what" "Content-Transfer-Encoding: $enc"]
+            set art2 [string map -nocase $map $art]
+        }
+        {end-of-string encountered while parsing multipart/} -
+        {boundary parameter is missing in multipart/} {
+            set art2 [regsub -all -nocase {Content-Type: multipart/[^\n]+\n(\s+[^\n]+\n)*} $art {}]
+        }
+        {improper line in header} {
+            set art2 [string map [list "\r\n" "\n" "\n \n" "\n\n"] $art]
+        }
+        {multiple Content-Transfer-Encoding fields starting with } {
+            set art2 [regsub -all {Content-Transfer-Encoding: [^\n]+\nContent-Transfer-Encoding: } $art {Content-Transfer-Encoding: }]
+        }
+    }
+    if {[info exists art2]} {
+        puts "RETRYING...\n"
+        if {! [catch {parse_art $art2} err]} return
+#printvars err
+
+        # If at first you don't succeed...
+        switch -regexp -matchvar matches $err {
+            {multiple Content-Transfer-Encoding fields starting with } -
+            {Can't handle content encoding "(.*)"} {
+                set art3 [regsub -nocase {content-transfer-encoding: [^\n]+\n(\s+[^\n]+\n)*} $art2 {}]
+            }
+	    {improper line in header: (.*)$} {
+                lassign $matches - what
+                set art3 [regsub ***=\n$what $art2 "\n\n&"]
+            }
+            {multiple Content-Type fields starting with (.*)$} -
+            {end-of-string encountered while parsing multipart/} -
+            {boundary parameter is missing in multipart/} {
+                set art3 [regsub -all -nocase {Content-Type: multipart/[^\n]+\n(\s+[^\n]+\n)*} $art2 {}]
+            }
+        }
+        if {[info exists art3]} {
+            puts "THIRD TIME LUCKY?...\n"
+            if {! [catch {parse_art $art3} err]} return
+        }
+    }
+#printvars err
+#return
+    set errdir $::rejects/$group
+    file mkdir $errdir
+    set errfile $errdir/$group.[incr ::reject_no]
+    puts "Can't recover, saving to $errfile\n"
+    set out [open $errfile.err w]
+    puts $out $err
+    #puts $out "$err\n$errstack"
+    close $out
+    set out [open $errfile.art w]
+    puts $out $art
+    close $out
+}
+
+# Hack to avoid ::mime::field_decode failure on Chinese posts using charset GBK,
+# see KBK's note at https://wiki.tcl-lang.org/page/Encoding+Translations+and+i18n
+set ::mime::reversemap(gbk) gb2312
+
+set tzmap {
+	{Pacific Standard Time} PST
+	{Pacific Daylight Time} PDT
+	{Eastern Daylight Time} EDT
+	{Eastern Standard Time} EST
+	{Central (US)} CST
+	PAC PST
+	BRT BT
+	MESZ CEST
+	LOCAL {}
+	ET EST
+	{ et} { EST}
+	{ ct} { CST}
+	{-EDT} { EDT}
+}
+
+proc parse_art art {
+    set mt [::mime::initialize -string $art]
+    set headers [::mime::getheader $mt]
+    ::mime::finalize $mt
+ 
+    set date [dict_getdef $headers Date {}]
+    # hacks for weird date formats
+    set date [regsub {^[[:alpha:]]{3,},} $date {}]
+    set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
+    set date [regsub {\m(\d\d)\.(\d\d)\.(\d\d)\M} $date {\1:\2:\3}]
+    set date [regsub {\m(\d\d): (\d):(\d\d)\M} $date {\1:0\2:\3}]
+    set date [regsub {\mGMT(.\d+)\M} $date {\1}]
+    set date [string map $::tzmap $date]
+    if {[catch {clock scan $date} dat]} {
+        #try stripping off an unrecognised timezone
+        set date [regsub {\m(\d\d:\d\d:\d\d)\s.*$} $date {\1}]
+        set date [regsub {\m(\d\d:\d\d)\s+[[:alpha:]/]+$} $date {\1}]
+        #remove extra space before minutes
+        set date [regsub {\m(\d\d): (\d\d:\d\d)\s.*$} $date {\1:\2}]
+        set dat [clock scan $date]
+    }
+    if {$dat > $::max_dat} return
+    #set fdat [clock format $dat]
+    #printvars fdat
+
+    set sub [dict_get_2 $headers Subject SUBJECT]
+    catch {set sub [::mime::field_decode $sub]}
+    set from [dict_get_2 $headers From FROM]
+    catch {set from [::mime::field_decode $from]}
+    set msgid [dict_get_2 $headers Message-ID Message-Id]
+    #set msgid [string trim $msgid <>]
+    regexp {<([^>]+)>} $msgid - msgid
+    set prev [dict_getdef $headers In-Reply-To {}]
+    if {$prev eq {}} {
+        set refs [dict_getdef $headers References {}]
+        set reflist [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} $refs]
+        set prev [lindex $reflist end]
+    }
+    set prev [string trim $prev <>]
+
+    #printvars sub from date msgid refs
+    lappend ::art_data $sub $from $dat $msgid $art $prev
+}
+set ::art_data {}
+
+proc write_db grpid {
+    archdb transaction {
+        foreach {sub from dat msgid art prev} $::art_data {
+            archdb eval {INSERT INTO arts(msgid,txt)
+                     VALUES($msgid,$art)
+                     ON CONFLICT DO NOTHING}
+        }
+    }
+    overdb transaction {
+        foreach {sub from dat msgid art prev} $::art_data {
+            overdb eval {INSERT INTO over(grpid,sub,frm,dat,msgid,prev)
+                     VALUES($grpid,$sub,$from,$dat,$msgid,$prev)
+                     ON CONFLICT DO NOTHING}
+        }
+    }
+    set ::art_data {}
+}
+
+proc dict_getdef {dict key def} {
+    if {[dict exists $dict $key]} {
+        return [dict get $dict $key]
+    }
+    return $def
+}
+
+proc dict_get_2 {dict key1 key2} {
+    if {[dict exists $dict $key1]} {
+        return [dict get $dict $key1]
+    }
+    return [dict_getdef $dict $key2 {}]
+}
+
+proc load_file infile {
+    set group [file rootname [file rootname [file tail $infile]]]
+    set grpid [store_group $group]
+
+    puts "Loading $group $grpid\n"
+
+    set rec 0
+    set art {}
+    set prev "\n"
+    if {[file extension $infile] eq ".zip"} {
+        set input [open "| unzip -p $infile" rb]
+        set ::reject_no 0
+    } else {
+        set input [open $infile rb]
+        set art [read $input]
+        close $input
+        set ::rejects /data3/retries
+        load_art $art $group
+        write_db $grpid
+        return
+    }
+    set up "\x1b\[A"
+    while {[gets $input line] >= 0} {
+        if {$prev eq "\n" && [regexp {^From -?\d+\s*$} $line]} {
+            # we found the start of a new article
+            if {$art ne {}} {load_art $art $group}
+            set art {}
+            set prev {}
+            if {[incr rec] % 1000 == 0} {
+                puts "${up}  $group writing $rec"
+                write_db $grpid
+            }
+        } else {
+            append art $prev
+            set prev "$line\n"
+        }
+    }
+    if {$art ne {}} {load_art $art $group; incr rec}
+    catch {close $input}
+    write_db $grpid
+    puts "${up}  $group total records: $rec rejects: $::reject_no"
+}
+
+foreach file $argv {load_file $file}
+

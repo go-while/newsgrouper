@@ -1,0 +1,28 @@
+#!/usr/local/bin/tclsh9.0
+
+# user_stats - count distinct users from the access logs
+
+set totalusers {}
+set countries {}
+foreach lf [lsort [glob /tmp/log8015_2*gz]] {
+    set dayusers {}
+    set regdayusers {}
+    set dayreqs 0
+    set if [open "| zcat $lf"]
+    while {[gets $if line] >= 0} {
+        incr dayreqs
+        lassign [split $line] country reg user
+        if {$user eq "-"} continue
+        dict incr dayusers $user
+        if {$reg eq "*"} {dict incr regdayusers $user}
+        dict incr totalusers $user
+        dict set countries $country $user 1
+    }
+    close $if
+    #puts $dayusers
+    puts "$lf\t[dict size $dayusers]\t[dict size $regdayusers]\t$dayreqs"
+}
+puts "total users: [dict size $totalusers]"
+set country_users [dict map {c u} $countries {dict size $u}]
+puts "users per country: [lsort -stride 2 -index 1 -integer -decreasing $country_users]"
+

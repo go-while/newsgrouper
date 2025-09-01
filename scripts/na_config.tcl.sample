@@ -1,0 +1,7 @@
+# General parameters
+set this_site mysite.org.uk
+set admin_email myself@somewhere.com
+
+# Parameters for NNTP connection
+set nntp_server news.somenewshost.com
+

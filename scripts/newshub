@@ -1,0 +1,311 @@
+#!/usr/local/bin/tclsh9.0
+
+# NewsHub - Aggregate, store and supply news data from multiple sources.
+
+source nu_config.tcl
+source retcl.tm
+source distcl.tcl
+package require mime
+
+package require retcl
+retcl create redis
+
+package require sqlite3
+sqlite3 overdb $over_db -fullmutex 1
+overdb timeout 20000
+sqlite3 archdb $arch_db
+archdb timeout 60000
+
+# various periods in seconds
+set fivemin 300
+set hour 3600
+set day 86400
+set week 604800
+set days30 2592000
+
+# articles before this date will be in archdb
+set arch_max_dat [clock scan {1/1/2004}]
+
+# articles before this date will be in blueworld, after in E-S
+set hist_max_dat [clock scan {1/1/2025}]
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {
+        upvar $var pv[incr n]
+	if {[info exists pv$n]} {
+            puts -nonewline "$var='[set pv$n]' "
+        } else {
+            puts -nonewline "$var: "
+        }
+    }
+    puts {}
+}
+
+proc convertit txt {
+    if {[catch {encoding convertto $txt} res]} {
+        #TODO Fix better?
+        return "ENCODING CONVERSION ERROR"
+    }
+    return $res
+}
+
+proc execute {func args} {
+    lassign $args arg1 arg2 arg3 arg4
+    switch $func {
+        art {
+            set art [get_art $arg1 $arg2]
+	    return -secs2keep $::week $art
+        }
+        mid {
+            set art [get_mid $arg1]
+	    return -secs2keep $::week $art
+        }
+        group {
+	    lassign [group_update $arg1] posts
+	    return -secs2keep 10 [list $posts 1 $posts]
+        }
+        posts {
+	    lassign [group_update $arg1] posts
+	    return -secs2keep 5 $posts
+        }
+        catchup {
+	    group_catchup $arg1 $arg2 $arg3 $arg4
+	    return
+        }
+        hdrs {
+	    lassign [group_update $arg1] posts grpid
+	    set top [expr {$arg2==0 ? $posts : $arg2}]
+	    set bot [expr {$top-500}]
+	    return -secs2keep 5 [get_hdrs $grpid $bot $top]
+        }
+        find {
+	    lassign [group_update $arg1] posts grpid
+	    return -secs2keep $::fivemin [find_hdrs $grpid $arg2 $arg3 $arg4]
+        }
+        groupstats {
+            return [overdb eval {SELECT name,stat,desc FROM groups}]
+        }
+        default {
+            error "UNRECOGNISED REQUEST: '$func'"
+        }
+    }
+}
+
+# Update group info in db tables "groups"&"over", return total posts & grpid
+proc group_update group {
+#printvars group_update group
+    set select {SELECT rowid,posts,servers FROM groups WHERE name == $group}
+    lassign [overdb eval $select] grpid posts servers
+    if {$grpid eq {}} {return 0}
+    if {$posts eq {}} {set posts 0}
+
+#printvars posts servers
+    set failed 1
+    foreach server $servers {
+        set old_last [overdb eval {SELECT last FROM counts WHERE grpid==$grpid AND server==$server}]
+        if {! [string is integer -strict $old_last]} {set old_last 0}
+        set failed [catch {distcl::get redis $server newer $group $old_last} newer]
+	if {! $failed} {
+            lassign $newer toomuch last xover
+            break
+        }
+    }
+#printvars group server failed toomuch old_last last
+    if {$failed || $last == $old_last} {return [list $posts $grpid]}
+
+    if {$toomuch} {
+        # too far out-of-date, need to catchup
+        set msgids [overdb eval {SELECT msgid FROM over WHERE grpid==$grpid ORDER BY dat DESC LIMIT 5}]
+        lassign [distcl::get redis $server catchup $group $old_last $msgids] toomuch last xover
+#printvars group toomuch last msgids
+    }
+    overdb eval {UPDATE counts SET last=$last WHERE grpid==$grpid AND server==$server}
+    if {! [overdb changes]} {
+        overdb eval {INSERT INTO counts(grpid,server,last) VALUES($grpid,$server,$last)}
+    }
+    set posts [group_store $group $xover]
+
+    # If we are still behind, catch-up in the background
+    if {$toomuch} {distcl::prefetch redis nh catchup $group $grpid $server $last}
+
+    return [list $posts $grpid]
+}
+
+proc group_store {group xover} {
+
+    set parsed [lmap hdr $xover {parse_over $hdr}]
+
+    overdb transaction {
+        set select {SELECT rowid,posts FROM groups WHERE name == $group}
+        lassign [overdb eval $select] grpid posts
+        if {$posts eq {}} {set posts 0}
+
+        foreach over $parsed {
+            lassign $over sub from dat msgid prev
+
+            overdb eval {INSERT INTO over(grpid,sub,frm,dat,msgid,prev,num)
+                         VALUES($grpid,$sub,$from,$dat,$msgid,$prev,$posts+1)
+                         ON CONFLICT DO NOTHING}
+            incr posts [overdb changes]
+        }
+        overdb eval {UPDATE groups SET posts=$posts WHERE name==$group}
+    }
+    return $posts
+}
+
+set tzmap {
+	{Pacific Standard Time} PST
+	{Pacific Daylight Time} PDT
+	{Eastern Daylight Time} EDT
+	{Eastern Standard Time} EST
+	{Central (US)} CST
+	PAC PST
+	BRT BT
+	MESZ CEST
+	LOCAL {}
+	ET EST
+	{ et} { EST}
+	{ ct} { CST}
+	{-EDT} { EDT}
+}
+
+# Extract article info from one XOVER line.
+proc parse_over hdr {
+    lassign [split $hdr \t] num sub from date msgid refs sz1 sz2 xref
+
+    catch {set sub [::mime::field_decode $sub]}
+    catch {set from [::mime::field_decode $from]}
+    set msgid [string trim $msgid <>]
+    set reflist [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} $refs]
+    set prev [lindex $reflist end]
+    set prev [string trim $prev <>]
+
+    #printvars sub from date msgid refs
+    # hacks for weird date formats
+    set date [regsub {^Date: } $date {}]
+    set date [regsub {^[[:alpha:]_]{3,},} $date {}]
+    set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
+    set date [regsub {\m(\d\d)\.(\d\d)\.(\d\d)\M} $date {\1:\2:\3}]
+    set date [regsub {\m(\d\d): (\d):(\d\d)\M} $date {\1:0\2:\3}]
+    set date [regsub {\mGMT(.\d+)\M} $date {\1}]
+    set date [string map $::tzmap $date]
+    if {[catch {clock scan $date -validate 0} dat]} {
+        #try stripping off an unrecognised timezone
+        set date [regsub {\m(\d\d:\d\d:\d\d)\s.*$} $date {\1}]
+        set date [regsub {\m(\d\d:\d\d)\s+[[:alpha:]/]+$} $date {\1}]
+        #remove extra space before minutes
+        set date [regsub {\m(\d\d): (\d\d:\d\d)\s.*$} $date {\1:\2}]
+        #set dat [clock scan $date]
+        set dat [clock scan $date -validate 0]
+    }
+
+    return [list $sub $from $dat $msgid $prev]
+}
+
+proc group_catchup {group grpid server old_last} {
+#printvars group_catchup group grpid server old_last
+#exit
+    after 1000
+    lassign [distcl::get redis $server catchup $group $old_last] toomuch last xover
+    overdb eval {UPDATE counts SET last=$last WHERE grpid==$grpid AND server==$server}
+    set posts [group_store $group $xover]
+
+    # If we are still behind, schedule another catchup
+    if {$toomuch} {
+        distcl::prefetch redis nh catchup $group $grpid $server $last
+    }
+    return
+}
+
+proc get_art {group num} {
+    set select {SELECT rowid,servers FROM groups WHERE name == $group}
+    lassign [overdb eval $select] grpid servers
+#printvars group num grpid servers 
+    overdb eval {SELECT msgid,dat FROM over WHERE grpid==$grpid AND num==$num} {
+#printvars msgid dat
+        if {$dat > $::hist_max_dat && "ng" in $servers} {
+            if {! [catch {distcl::get redis ng mid <$msgid>} art]} {
+                return [join $art \n]
+            }
+        }
+        if {$dat > $::arch_max_dat && "na" in $servers} {
+            if {! [catch {distcl::get redis na mid <$msgid>} art]} {
+                return [join $art \n]
+            }
+        }
+        archdb eval {SELECT txt FROM arts WHERE msgid==$msgid} {
+                    return [convertit $txt]
+        }
+    }
+    error "Article not found"
+}
+
+proc get_mid msgid {
+    set mid [string trim $msgid <>]
+    archdb eval {SELECT txt FROM arts WHERE msgid==$mid} {
+        return [convertit $txt]
+    }
+    return [join [distcl::get redis na mid $msgid] \n]
+}
+
+proc get_hdrs {grpid bot top} {
+    set ::msgid2num [dict create]
+    set ::missing_ref 0
+    set hdrs {}
+
+    overdb eval {SELECT sub,frm,dat,msgid,prev,num FROM over
+            WHERE grpid==$grpid AND num>$bot AND num<=$top ORDER BY num} {
+        dict set ::msgid2num $msgid $num
+
+        if {$prev eq {}} {
+            set prevnum 0
+        } else {
+            set prevnum [get_num $grpid $prev]
+        }
+
+        set sub [convertit $sub]
+        set frm [convertit $frm]
+        lappend hdrs $num [list $prevnum $sub $frm $dat $msgid]
+    }
+    return $hdrs
+}
+
+proc get_num {grpid msgid} {
+    if {[dict exists $::msgid2num $msgid]} {
+        return [dict get $::msgid2num $msgid]
+    }
+    set num [incr ::missing_ref -1]
+    dict set ::msgid2num $msgid $num
+    if {[info level] > 20} {return $num} ;# prevent runaway recursion
+
+    overdb eval {SELECT prev FROM over WHERE grpid==$grpid AND msgid==$msgid} {
+        if {$prev ne {}} {
+            set num [get_num $grpid $prev]
+            dict set ::msgid2num $msgid $num
+        }
+    }
+    return $num
+}
+
+proc find_hdrs {grpid sub frm tim} {
+    set hdrs {}
+    set limit 500
+
+    set sql {SELECT sub,frm,dat,msgid,prev,num FROM over WHERE grpid==$grpid }
+    if {$sub ne {}} {set sub %$sub%; append sql {AND sub LIKE $sub }}
+    if {$frm ne {}} {set frm %$frm%; append sql {AND frm LIKE $frm }}
+    if {$tim ne {}} {append sql {AND dat <= $tim }}
+    append sql {ORDER BY dat DESC}
+    append sql " LIMIT $limit"
+    overdb eval $sql {
+        set sub [convertit $sub]
+        set frm [convertit $frm]
+        lappend hdrs $num [list 0 $sub $frm $dat $msgid]
+    }
+    set more_dat [expr {[llength $hdrs]==$limit*2 ? [lindex $hdrs end 3] : 0}]
+    return [list $more_dat $hdrs]
+}
+
+distcl::serve redis nh execute
+

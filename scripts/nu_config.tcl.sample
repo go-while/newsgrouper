@@ -1,0 +1,4 @@
+# General parameters
+set archive_dir /some/directory
+set archive_max 500
+

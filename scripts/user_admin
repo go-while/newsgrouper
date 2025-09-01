@@ -1,0 +1,114 @@
+#!/usr/local/bin/tcl
+# Quick&Dirty User Administration for Newsgrouper
+
+source ng_config.tcl
+set olddb [file exists $user_db]
+
+package require Tk
+package require sqlite3
+package require md5
+package require md5crypt
+
+label .numlab -text {Number}
+label .num -textvariable number
+label .maxlab -text {Min/Max}
+label .min -textvariable min
+label .max -textvariable max
+label .emaillab -text EMail
+entry .email -textvariable user_email -width 40
+label .passlab -text Password
+entry .pass -textvariable user_password -width 40
+label .cookielab -text {Cookie}
+label .cookie -textvariable cookie
+#label .statslab -text {Statistics}
+button .find -text {Find Email} -command find_email
+button .prev -text {Previous} -command {find_incr -1}
+button .next -text {Next} -command {find_incr 1}
+button .clear -text {Clear} -command clear
+button .add -text {Add User} -command add_user
+button .get_stats -text {Statistics} -command get_stats
+label .stats -textvariable stats
+#grid .numlab .num .maxlab .min .max -sticky w
+grid .numlab .num -sticky w
+grid .emaillab .email - - - -sticky w
+grid .passlab .pass - - - -sticky w
+grid .cookielab .cookie - - - -sticky w
+grid .find .prev .next .clear .add
+grid .get_stats .stats - - - -sticky w
+
+proc find_email {} {
+    set ::number {Not Found}
+    set ::user_password {}
+    set enc_email [md5crypt::md5crypt $::user_email $::user_salt]
+    db eval {SELECT num,pass,cookie FROM users WHERE email == $enc_email} {
+        set ::number $num
+        set ::user_password $pass
+        set ::cookie $cookie
+    }
+}
+
+proc find_incr inc {
+    if {[catch {incr ::number $inc}]} {
+        set ::number [expr {$inc>0 ? $::min : $::max}]
+    }
+    set ::user_email {}
+    set ::user_password {}
+    set ::cookie {}
+
+    set found 0
+    while {$::number >= $::min && $::number <= $::max} {
+        db eval {SELECT email,pass,cookie FROM users WHERE num == $::number} {
+            set ::user_email $email
+            set ::user_password $pass
+            set ::cookie $cookie
+            set found 1
+        }
+        if {$found} break
+        incr ::number $inc
+    }
+}
+
+proc clear {} {
+    set ::number {}
+    set ::user_email {}
+    set ::user_password {}
+    set ::cookie {}
+}
+
+proc add_user {} {
+    if {$::user_email eq {} || $::user_email eq "REQUIRED"} {
+        set ::user_email REQUIRED
+        focus .email
+        return
+    }
+    if {$::user_password eq {} || $::user_password eq "REQUIRED"} {
+        set ::user_password REQUIRED
+        focus .pass
+        return
+    }
+    set enc_email [md5crypt::md5crypt $::user_email $::user_salt]
+    set enc_pass [md5crypt::md5crypt $::user_password $::user_salt]
+    db eval {INSERT INTO users(email,pass) VALUES($enc_email,$enc_pass)}
+    set ::number [db eval {SELECT num FROM users WHERE email == $enc_email}]
+    set ::max [db eval {SELECT max(num) FROM users}]
+}
+
+proc get_stats {} {
+    set ::max [db eval {SELECT max(num) FROM users}]
+    set ::min [db eval {SELECT min(num) FROM users}]
+    set reg [db eval {SELECT count(*) FROM users where email IS NOT NULL}]
+    set lin [db eval {SELECT count(*) FROM users where cookie IS NOT NULL}]
+    set ::stats "Min:$::min Max:$::max Registered:$reg Logged-in:$lin"
+}
+
+sqlite3 db $user_db
+if {! $olddb} {
+    db eval {CREATE TABLE users(num INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE, pass TEXT, cookie TEXT, params TEXT)}
+    db eval {CREATE INDEX users_email ON users(email)}
+    db eval {CREATE INDEX users_cookie ON users(cookie)}
+}
+get_stats
+
+bind all <Control-c> {console show}
+

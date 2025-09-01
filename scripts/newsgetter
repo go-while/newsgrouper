@@ -1,0 +1,210 @@
+#!/usr/local/bin/tclsh9.0
+
+# NewsGetter - get data from the nntp server in response to redis requests.
+
+proc putd s {puts $s}
+
+set nntp_port 119
+lassign $argv service debug
+source ${service}_config.tcl
+source retcl.tm
+source distcl.tcl
+
+package require retcl
+retcl create redis
+
+source nntp.tcl; # For local fix
+package require nntp
+
+set debug [expr {$debug==1 ? 1 : 0}]
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+proc nntp_connect {} {
+    set ::nntp [::nntp::nntp $::nntp_server $::nntp_port]
+    $::nntp configure -binary 1 -debug $::debug
+    if {[info exists ::nntp_user]} {
+        $::nntp authinfo $::nntp_user $::nntp_pass
+    }
+}
+nntp_connect
+puts [$nntp mode_reader]
+
+proc nntp_retry script {
+    if {[catch {uplevel $::nntp $script} result]} {
+        switch -glob $result {
+            {nntp: unexpected EOF *} -
+            {error flushing * broken pipe} {
+                puts "CAUGHT: '$result', RETRYING: '$script'"
+	        catch {$::nntp quit}
+	        after 100
+	        nntp_connect
+	        uplevel $::nntp $script
+            }
+            default {error $result}
+        }
+    } else {
+        return $result
+    }
+}
+
+set week 604800; #seconds
+set day 86400  ; #seconds
+set hour 3600  ; #seconds
+set fivemin 300; #seconds
+set thisyear [clock format [clock seconds] -format %Y]
+
+proc execute {func args} {
+    lassign $args grp num min fld pat
+    switch $func {
+        group {return -secs2keep 5 [groupinfo $grp]}
+        hdrs {
+            lassign [groupinfo $grp] est first last
+
+	    set end $num
+            set xover {}
+            while {$end >= $first} {
+                # Round the start point for better caching of followup requests
+                set start [expr {max($first, ((($end-500) / 100) * 100) + 1)}]
+                #puts "xover $start $end"
+                ledit xover -1 -1 {*}[nntp_retry {xover $start $end}]
+                if {[llength $xover] > 300} break
+	        set end [expr {$start - 1}]
+            }
+	    #puts "length of xover is [llength $xover]"
+	    return -secs2keep $::hour [get_headers $xover]
+        }
+        xpat {
+            lassign [groupinfo $grp] est first last
+            if {$min > $first} {set first $min}
+	    set end $num
+	    #putd "first=$first last=$last end=$end"
+            set xpat {}
+            set step 10000
+            while {$end >= $first} {
+                # Round the start point for better caching of followup requests
+                set start [expr {max($first, ((($end-$step) / 1000) * 1000) + 1)}]
+                #putd "nntp_retry {$::nntp xpat $fld $start-$end $pat}"
+                set output [nntp_retry {xpat $fld $start-$end $pat}]
+		#putd $output
+                ledit xpat -1 -1 {*}$output
+	        set end [expr {$start - 1}]
+                if {[llength $xpat] > 30} break
+	        incr step $step ;# double step size
+            }
+            if {$end < $first} {set end -1}
+	    #puts "length of xover is [llength $xover]"
+	    return -secs2keep $::hour [list $end $xpat]
+        }
+        art {
+            groupinfo $grp
+            set val [nntp_retry {article $num}]
+            return -secs2keep $::week $val
+        }
+        mid {
+            # $grp is the message-id here
+            set val [nntp_retry {article $grp}]
+            return -secs2keep $::week $val
+        }
+        post {
+            # $grp is the article text here
+            set text [encoding convertfrom $grp]
+            return [nntp_retry {post $text}]
+        }
+        newer {
+            lassign [nntp_retry {group $grp}] est first last
+            if {$last <= $num} {return [list 0 $last]}
+            set start [expr {max($first,$num+1)}]
+            if {$last-$start > 999} {return [list 1 $last]}
+            set xover [nntp_retry {xover $start $last}]
+            return [list 0 $last $xover]
+        }
+        catchup {
+            lassign $args group old_last msgids
+            lassign [nntp_retry {group $group}] est first last
+            # msgids are for the last few articles we have indexed from
+            # this group, possibly from a different server.
+            # We try to find one of them to use as a starting point.
+            set num {}
+	    foreach msgid $msgids {
+                if {[catch {nntp_retry {article <$msgid>}} art]} continue
+                set xref [lsearch -glob -nocase -inline $art xref:*]
+                set xref2 [string map [list ${group} "\x01"] $xref]
+                if {[regexp {\m\x01:(\d+)\M} $xref2 - num]} break
+            }
+            if {$num eq {}} {
+                set start [expr {max($old_last+1,$first)}]
+            } else {
+                set start [expr {max($old_last+1,$num-10)}]
+            }
+	    set top [expr {$start+999}]
+	    set toomuch [expr {$last > $top}]
+	    if {$toomuch} {set last $top}
+            set xover [nntp_retry {xover $start $last}]
+            return [list $toomuch $last $xover]
+        }
+        xover {
+            lassign $args group start end
+            nntp_retry {group $group}
+            return [nntp_retry {xover $start $end}]
+        }
+        grouplist {
+            return -secs2keep $::day [nntp_retry {list}]
+        }
+        desclist {
+            return -secs2keep $::day [nntp_retry {xgtitle *}]
+        }
+        default {
+            error "UNRECOGNISED REQUEST: '$func'"
+        }
+    }
+}
+
+proc groupinfo grp {
+    set groupinfo [nntp_retry {group $grp}]
+    return $groupinfo
+}
+
+proc get_headers {xover} {
+
+    set msgid2num [dict create]
+    set headers {}
+
+    foreach hdr $xover {
+        lassign [split $hdr \t] num sub aut tim id refs sz1 sz2 xref
+
+        dict set msgid2num $id $num
+
+        # Find post this one is followup to -
+        # a single article number instead of the list of referenced msgids
+        set prev 0
+        foreach ref [lreverse $refs] {
+            if {[dict exists $msgid2num $ref]} {
+                set prev [dict get $msgid2num $ref]
+                if {$prev > 0} break
+	    }
+        }
+        if {$prev == 0 && [llength $refs]} {
+            set prev [incr missing_ref -1]
+            foreach ref $refs {
+                dict set msgid2num $ref $prev
+            }
+        }
+        if {[regexp {(\d\d? [[:alpha:]]{3}) (\d{4})} $tim - date year]} {
+            if {$year == $::thisyear} {
+                set tim $date
+            } else {
+                set tim "$date $year"
+            }
+        }
+	lappend headers $num [list $prev $sub $aut $tim $id]
+    }
+    return $headers
+}
+
+distcl::serve redis $service execute
+

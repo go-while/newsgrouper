@@ -1,0 +1,158 @@
+#!/usr/local/bin/tclsh9.0
+
+# NewsUtility - Compute X-Face images, do ageing of group read statistics,
+#               retrieve group charters, search group archive files.
+
+proc putd s {puts $s}
+
+source nu_config.tcl
+source retcl.tm
+source distcl.tcl
+
+package require retcl
+retcl create redis
+
+set fivemin 300; #seconds
+set hour 3600  ; #seconds
+set day 86400  ; #seconds
+set week 604800; #seconds
+set days30 2592000
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+# Each day we fade the group read counts by 0.9 to get decaying averages
+proc age_groupreads {} {
+    set age_count 0
+    set rem_count 0
+    foreach {group reads} [redis -sync zrange groupreads 0 -1 withscores] {
+        set new_score [expr {$reads * 9 / 10}]
+        #printvars group reads new_score
+	if {$new_score > 0} {
+            redis -sync zadd groupreads $new_score $group
+            incr age_count
+	} else {
+            redis -sync zrem groupreads $group
+            incr rem_count
+	}
+    }
+    puts "Aged read counts for $age_count groups, removed $rem_count."
+    after [expr {$::day * 1000}] age_groupreads
+}
+after [expr {$hour * 1000}] age_groupreads
+
+proc execute {func args} {
+    lassign $args data
+    switch $func {
+        face {
+            set conversion [open "| uncompface -X | xbmtopbm | pnmtopng" wb+]
+            puts -nonewline $conversion $data
+            close $conversion write
+            set png [read $conversion]
+            close $conversion
+            return -secs2keep $::days30 $png
+        }
+        charter {
+	    return -secs2keep $::days30 [get_charter $data]
+        }
+        ar_exists {
+	    return -secs2keep $::days30 [ar_exists $data]
+        }
+        ar_find {
+	    return -secs2keep $::hour [ar_find {*}$args]
+        }
+        default {
+            error "UNRECOGNISED REQUEST: '$func'"
+        }
+    }
+}
+
+proc get_charter group {
+
+    set hier [group_hier $group]
+    set url "https://ftp.isc.org/usenet/control/$hier/$group.gz"
+    set ctlmsgs [open "| wget -q -O - $url | gunzip"]
+    fconfigure $ctlmsgs -translation binary
+
+    while 1 {
+        if {[gets $ctlmsgs line] < 0} {
+            catch {close $ctlmsgs}
+            return {}
+        }
+        if {[string trim $line] eq "For your newsgroups file:"} break
+    }
+    gets $ctlmsgs
+    gets $ctlmsgs last
+    set charter {}
+    while {[gets $ctlmsgs line] >= 0} {
+        if {$line eq "-- "} break
+        if {[string range $line 0 4] eq "From " && $last eq ""} break
+        append charter $line "\n"
+        set last $line
+    }
+    catch {close $ctlmsgs}
+    return [string trim $charter]
+}
+
+# Check group is valid and return top-level hierarchy
+proc group_hier group {
+    set group_re {^[[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+$}
+    if {[regexp $group_re $group]} {
+        return [lindex [split $group .] 0]
+    }
+    error "Invalid group '$group'"
+}
+
+# Check if a group archive file exists
+proc ar_exists {group} {
+    set hier [group_hier $group]
+    set file [file join $::archive_dir $hier $group.mbox.zip]
+    return [file readable $file]
+}
+
+# Find articles matching a pattern in a group archive file
+proc ar_find {group pattern head body nocase} {
+    set hier [group_hier $group]
+    set file [file join $::archive_dir $hier $group.mbox.zip]
+    if {$head && $body} {
+        set opts {}
+    } elseif {$head} {
+        set opts {-H}
+    } else {
+        set opts {-B}
+    }
+    if {$nocase} {
+        append opts { -i}
+    }
+    set art {}
+    set arts {}
+    set prev "\n"
+
+    set command "| unzip -p $file | mboxgrep $opts"
+    # escape redirections
+    switch -glob $pattern |* - <* - >* - 2>* {set pattern \\$pattern}
+    lappend command $pattern
+
+    set input [open $command]
+    while {[gets $input line] >= 0} {
+        if {$prev eq "\n" && [regexp {^From -?\d+\s*$} $line]} {
+            # we found the start of a new article
+            if {$art ne {}} {lappend arts $art}
+            set art {}
+            set prev {}
+            if {[llength $arts] >= $::archive_max} break
+        } else {
+            append art $prev
+            set prev "$line\n"
+        }
+    }
+    if {$art ne {}} {lappend arts $art}
+    catch {close $input}
+    return [encoding convertto $arts]
+}
+
+distcl::serve redis nu execute
+

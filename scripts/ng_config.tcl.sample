@@ -1,0 +1,23 @@
+# General parameters
+set this_site mysite.org
+set admin_email myself@somewhere.com
+#old_site mysite.org.uk
+
+# Parameters for Users database
+set user_db /some/path/to/users.db
+set user_salt something
+
+# Parameters for NNTP connection
+set nntp_server news.somenewshost.org
+set nntp_user myusername
+set nntp_pass myuserpassword
+
+# Parameters for UUCP connection
+set uucp_server myuucppeer
+
+# Parameters for overview and article databases
+set over_db /some/path/news_over.db
+set arch_db /some/path/news_archive.db
+
+# Groups to avoid due to spam, binaries, etc.
+set blocked_groups {some.crap other.crap}

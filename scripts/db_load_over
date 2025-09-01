@@ -1,0 +1,145 @@
+#!/usr/local/bin/tcl
+#!/usr/local/bin/tclsh9.0
+# Load newsgroup overviews from commercial provider into database
+
+lassign $argv grppat firstgrp
+if {$grppat eq {}} {puts "Usage: $argv0 <group-pattern> ?<start-group>?"; exit}
+
+source nc_config.tcl
+
+set over_db /data/news_over.db
+
+package require sqlite3
+package require mime
+
+sqlite3 odb $over_db
+odb timeout 60000
+
+source retcl.tm
+package require retcl
+retcl create redis
+source distcl.tcl
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+# Hack to avoid ::mime::field_decode failure on Chinese posts using charset GBK,
+# see KBK's note at https://wiki.tcl-lang.org/page/Encoding+Translations+and+i18n
+set ::mime::reversemap(gbk) gb2312
+
+set tzmap {
+	{Pacific Standard Time} PST
+	{Pacific Daylight Time} PDT
+	{Eastern Daylight Time} EDT
+	{Eastern Standard Time} EST
+	{Central (US)} CST
+	PAC PST
+	BRT BT
+	LOCAL {}
+}
+
+proc parse hdr {
+    lassign [split $hdr \t] num sub from date msgid refs sz1 sz2 xref
+
+    catch {set sub [::mime::field_decode $sub]}
+    catch {set from [::mime::field_decode $from]}
+    set msgid [string trim $msgid <>]
+    set reflist [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} $refs]
+    set prev [lindex $reflist end]
+    set prev [string trim $prev <>]
+
+    #printvars sub from date msgid refs
+    # hacks for weird date formats
+    set date [regsub {^[[:alpha:]_]{3,},} $date {}]
+    set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
+    set date [regsub {\m(\d\d)\.(\d\d)\.(\d\d)\M} $date {\1:\2:\3}]
+    set date [regsub {\m(\d\d): (\d):(\d\d)\M} $date {\1:0\2:\3}]
+    set date [string map $::tzmap $date]
+    if {[catch {clock scan $date} dat]} {
+        #try stripping off an unrecognised timezone
+        set date [regsub {\m(\d\d:\d\d:\d\d)\s.*$} $date {\1}]
+        set dat [clock scan $date]
+        #set dat [clock scan $date -validate 0]
+    }
+
+    lappend ::art_data $sub $from $dat $msgid $prev
+}
+
+proc store_group group {
+    odb eval {INSERT INTO groups(name) VALUES($group) ON CONFLICT DO NOTHING}
+    return [odb eval {SELECT rowid FROM groups WHERE name == $group}]
+}
+
+proc store_over grpid {
+    foreach {sub from dat msgid prev} $::art_data {
+
+        odb eval {INSERT INTO over(grpid,sub,frm,dat,msgid,prev)
+                 VALUES($grpid,$sub,$from,$dat,$msgid,$prev)
+                 ON CONFLICT DO NOTHING}
+    }
+}
+
+source nntp.tcl; # For local fix
+
+package require nntp
+
+proc nntp_connect {} {
+    set ::nntp [::nntp::nntp $::nntp_server]
+    $::nntp configure -binary 1 -debug 0
+    $::nntp authinfo $::nntp_user $::nntp_pass
+}
+nntp_connect
+puts [$nntp mode_reader]
+
+#set grouplist [$nntp list]
+set grouplist [distcl::get redis na grouplist]
+puts "[llength $grouplist] groups found"
+set grouplist [lsort $grouplist]
+
+set fails [open /data3/over_fails a]
+set gfails [open /data3/over_group_fails a]
+
+foreach groupline $grouplist {
+    lassign $groupline group last first status
+    if {$status eq "n"} continue
+    if {! [string match $grppat $group]} continue
+    if {$group < $firstgrp} continue
+    if {[string first .binari $group] >= 0} continue
+    if {[string first .binary $group] >= 0} continue
+    if {[string first .binaer $group] >= 0} continue
+    if {$group eq "alt.sex" || [string match alt.sex.* $group]} continue
+    if {$group in {free.pt free.usenet free.willey}} continue
+    set grpid [store_group $group]
+
+    #set groupinfo [$nntp group $group]
+    if {[catch {$nntp group $group} groupinfo]} {
+        puts "GROUP NOT FOUND: $group"
+        puts $gfails $group
+        continue
+    }
+    puts "loading: '$group' '$groupinfo'"
+    lassign $groupinfo est first last
+    scan $last %d top
+    scan $first %d bottom
+    for {set start $bottom} {$start <= $top} {set start [expr {$end+1}]} {
+        set ::art_data {}
+        set end [expr {min($start+999,$top)}]
+        set xover [$nntp xover $start $end]
+        foreach hdr $xover {
+            if {[catch {parse $hdr} err]} {
+                puts "FAILED TO PARSE '$hdr' - '$err'"
+                puts $fails [list $group $grpid $hdr $err]
+                flush $fails
+            }
+        }
+	puts -nonewline .; flush stdout
+        odb transaction {store_over $grpid}
+    }
+    puts done.
+}
+close $fails
+close $gfails
+

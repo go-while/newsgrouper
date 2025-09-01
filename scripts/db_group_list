@@ -1,0 +1,113 @@
+#!/usr/local/bin/tcl
+
+# db_group_list - get the full list of groups.
+#
+# Update groups db table with descriptions and statuses.
+# Set groupstats as a redis hash mapping groups to their status, max and description.
+
+package require sqlite3
+
+sqlite3 overdb /data/news_over.db
+overdb timeout 60000
+
+source ng_config.tcl
+#source retcl.tm ;# for local hacks
+package require retcl
+retcl create redis
+source distcl.tcl
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+overdb eval {SELECT name FROM groups} {
+    set sources($name) db
+    incr oldgroups
+}
+puts "db had $oldgroups groups."
+
+foreach source {na ng} {
+    set desclist [distcl::get redis $source desclist]
+    puts "$source [llength $desclist] descriptions found."
+
+    foreach groupdesc $desclist {
+        if {[regexp {(\S+)\t+(.*)$} $groupdesc - name desc]} {
+            set descs($name) $desc
+        }
+    }
+}
+set descs(newsgrouper.support) {Support for the newsgrouper.org web interface to Usenet.}
+
+foreach source {ng na} {
+    set grouplist [distcl::get redis $source grouplist]
+    puts "$source [llength $grouplist] groups found."
+
+    foreach groupline $grouplist {
+        lassign $groupline group last first status
+#if {$status eq "n"} {puts $groupline}
+        if {$status eq "n"} continue
+        scan $last %d top
+	lappend sources($group) $source
+	set stats($group) [list $status $top]
+    }
+}
+puts "Total [array size sources] groups found."
+#puts $sources(comp.lang.tcl.announce)
+#puts [info exists stats(comp.lang.tcl.announce)]
+#puts [info exists descs(comp.lang.tcl.announce)]
+#exit
+
+set newgroups 0
+foreach group [array names sources] {
+    if {[incr progress] % 1000 == 0} {puts -nonewline .; flush stdout}
+
+    if {$group in $blocked_groups} continue
+
+    if {"db" ni $sources($group)} {
+        overdb eval {INSERT INTO groups(name) VALUES($group)}
+    }
+    if {[info exists stats($group)]} {
+        set stat_desc $stats($group)
+        #lassign $stats($group) stat_desc top
+    } else {
+        set stat_desc {x 0}
+        #lassign {x 0} stat_desc top
+    }
+    #set top [lindex $stat_desc 1]
+    #printvars group stat_desc
+    if {[info exists descs($group)]} {
+        lappend stat_desc $descs($group)
+    }
+    #printvars stat_desc
+
+    redis -sync hset groupstats.0 $group $stat_desc
+
+    lassign $stat_desc stat top desc
+    set servers [lmap src $sources($group) {if {$src=="db"} continue else {set src}}]
+    overdb eval {UPDATE groups SET servers=$servers,stat=$stat,desc=$desc WHERE name==$group}
+
+    # Also record how many new posts each group has
+    set old_stat [redis -sync hget groupstats.2 $group]
+    if {$old_stat == "(nil)"} {
+        set old_top 0
+        incr newgroups
+    } else {
+        set old_top [lindex $old_stat 1]
+    }
+    if {! [string is integer -strict $old_top]} {set old_top 0}
+    set newposts [expr {$top - $old_top}]
+    redis -sync zadd newposts $newposts $group
+}
+puts "$newgroups new groups found."
+
+# backup older versions and make new version active
+if {[redis -sync exists groupstats.1]} {
+    redis -sync rename groupstats.1 groupstats.2
+}
+if {[redis -sync exists groupstats]} {
+    redis -sync rename groupstats groupstats.1
+}
+redis -sync rename groupstats.0 groupstats
+

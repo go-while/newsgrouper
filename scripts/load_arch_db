@@ -1,0 +1,190 @@
+#!/usr/local/bin/tclsh9.0
+# Load newsgroup files (zipped mbox) from Internet Archive into database
+
+set arch_db /data2/news_archive.db
+set rejects /data3/rejects
+
+package require sqlite3
+package require mime
+
+set olddb [file exists $arch_db]
+sqlite3 db $arch_db
+if {! $olddb} {
+    db eval {CREATE TABLE arts(msgid TEXT PRIMARY KEY, art TEXT)}
+
+    db eval {CREATE TABLE over(grp TEXT, sub TEXT, frm TEXT, dat INTEGER, msgid TEXT)}
+    db eval {CREATE UNIQUE INDEX over_gm ON over(grp,msgid)}
+
+    #db eval {CREATE INDEX over_gsd ON over(grp,sub,dat)}
+    #db eval {CREATE INDEX over_gfd ON over(grp,frm,dat)}
+    #db eval {CREATE INDEX over_gd ON over(grp,dat)}
+
+    db eval {CREATE TABLE refs(src TEXT, dst TEXT)}
+    db eval {CREATE UNIQUE INDEX refs_sd ON refs(src,dst)}
+
+    #db eval {CREATE INDEX refs_src ON refs(src)}
+    #db eval {CREATE INDEX refs_dst ON refs(dst)}
+}
+db timeout 60000
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+proc load_art {art group} {
+    # If parsing fails, try various workarounds
+    if {! [catch {parse_art $art $group} err]} return
+    #set errstack [info errorstack]
+    puts "load_art FAILED: '$err'"
+
+    switch -regexp -matchvar matches $err {
+        {multiple Content-Type fields starting with (.*)$} {
+            lassign $matches - contype
+            set art2 [regsub $contype $art {}]
+        } {Can't handle content encoding "(.*)"} {
+            lassign $matches - what
+            if {[regexp {8.?bit} $what]} {
+                set enc 8bit
+            } elseif {[regexp {7.?bit} $what]} {
+                set enc 7bit
+            } else {
+                lassign [split $what] enc
+            }
+            set map [list "Content-Transfer-Encoding: $what" "Content-Transfer-Encoding: $enc"]
+            set art2 [string map -nocase $map $art]
+        } {end-of-string encountered while parsing multipart/} -
+          {boundary parameter is missing in multipart/} -
+          {improper line in header} {
+            set art2 [regsub -nocase {Content-Type: multipart/[^\n]+\n(\s+[^\n]+\n)*} $art {}]
+        }
+    }
+    if {[info exists art2]} {
+        puts "RETRYING...\n"
+        if {! [catch {parse_art $art2 $group} err2]} return
+
+        # If at first you don't succeed...
+        switch -regexp -matchvar matches $err {
+            {Can't handle content encoding "(.*)"} {
+                set art3 [regsub {Content-Transfer-Encoding: [^\n]+\n(\s+[^\n]+\n)*} $art2 {}]
+            }
+	    {improper line in header: ([^\n]+\n)} {
+                lassign $matches - what
+                set art3 [regsub ***=$what $art2 "\n&"]
+            }
+        }
+        if {[info exists art3]} {
+            puts "TRYING AGAIN...\n"
+            if {! [catch {parse_art $art3 $group} err3]} return
+        }
+    }
+
+    set errdir $::rejects/$group
+    file mkdir $errdir
+    set errfile $errdir/$group.[incr ::reject_no]
+    puts "Can't recover, save to $errfile\n"
+    set out [open $errfile.err w]
+    puts $out $err
+    #puts $out "$err\n$errstack"
+    close $out
+    set out [open $errfile.art w]
+    puts $out $art
+    close $out
+}
+
+# Hack to avoid ::mime::field_decode failure on Chinese posts using charset GBK,
+# see KBK's note at https://wiki.tcl-lang.org/page/Encoding+Translations+and+i18n
+set ::mime::reversemap(gbk) gb2312
+
+proc parse_art {art group} {
+    set mt [::mime::initialize -string $art]
+    set headers [::mime::getheader $mt]
+    ::mime::finalize $mt
+ 
+    set sub [dict_get_2 $headers Subject SUBJECT]
+    catch {set sub [::mime::field_decode $sub]}
+    set from [dict_get_2 $headers From FROM]
+    catch {set from [::mime::field_decode $from]}
+    set date [dict getdef $headers Date {}]
+    set msgid [dict_get_2 $headers Message-ID Message-Id]
+    set msgid [string trim $msgid <>]
+    set refs [dict getdef $headers References {}]
+    set reflist [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} $refs]
+
+    #printvars sub from date msgid refs
+    # hacks for weird date formats
+    set date [regsub {^[[:alpha:]]{3,},} $date {}]
+    set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
+    if {[catch {clock scan $date} dat]} {
+        #try stripping off an unrecognised timezone
+        set date [regsub {\s\S+\s*$} $date {}]
+        set dat [clock scan $date]
+    }
+    #set fdat [clock format $dat]
+    #printvars fdat
+
+    lappend ::art_data $group $sub $from $dat $msgid $art $reflist
+}
+set ::art_data {}
+
+proc write_db {} {
+    foreach {group sub from dat msgid art reflist} $::art_data {
+
+        db eval {INSERT INTO arts(msgid,art)
+                 VALUES($msgid,$art)
+                 ON CONFLICT DO NOTHING}
+
+        db eval {INSERT INTO over(grp,sub,frm,dat,msgid)
+                 VALUES($group,$sub,$from,$dat,$msgid)
+                 ON CONFLICT DO NOTHING}
+
+        foreach ref $reflist {
+            set ref [string trim $ref <>]
+            db eval {INSERT INTO refs(src,dst) VALUES($msgid,$ref)
+                     ON CONFLICT DO NOTHING}
+        }
+    }
+    set ::art_data {}
+}
+
+proc dict_get_2 {dict key1 key2} {
+    if {[dict exists $dict $key1]} {
+        return [dict get $dict $key1]
+    }
+    return [dict getdef $dict $key2 {}]
+}
+
+proc load_file infile {
+    set group [file rootname [file rootname [file tail $infile]]]
+    puts "Loading $group\n"
+    set ::reject_no 0
+
+    set rec 0
+    set art {}
+    set prev "\n"
+    set input [open "| unzip -p $infile" rb]
+    set up "\x1b\[A"
+    while {[gets $input line] >= 0} {
+        if {$prev eq "\n" && [regexp {^From -?\d+\s*$} $line]} {
+            # we found the start of a new article
+            if {$art ne {}} {load_art $art $group}
+            set art {}
+            set prev {}
+            if {[incr rec] % 1000 == 0} {
+                puts "${up}  $group writing $rec"
+                db transaction write_db
+            }
+        } else {
+            append art $prev
+            set prev "$line\n"
+        }
+    }
+    if {$art ne {}} {load_art $art $group}
+    catch {close $input}
+    db transaction write_db
+    puts "${up}  $group total records $rec"
+}
+
+foreach file $argv {load_file $file}
+

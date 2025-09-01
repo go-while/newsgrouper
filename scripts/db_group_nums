@@ -1,0 +1,71 @@
+#!/usr/local/bin/tcl
+# Compute post numbers for each group
+
+lassign $argv grpat
+if {$grpat eq {}} {puts "Usage: db_group_nums <group-pattern>"; exit}
+
+set over_db /data/news_over.db
+
+package require sqlite3
+
+sqlite3 overdb $over_db
+overdb timeout 60000
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+if {$grpat eq "subscribed"} {
+    package require retcl
+    retcl create redis
+
+    set ugrps [redis -sync keys "ugrp *"]
+    foreach ugrp $ugrps {
+        set grpcounts [redis -sync hgetall $ugrp]
+        foreach {group count} $grpcounts {
+            #puts "$ugrp : $group $count"
+            set subgroups($group) $count
+        }
+    }
+    puts "Total subscribed groups: [array size subgroups]"
+    set groups [lsort [array names subgroups]]
+    #set groups [lsort -decreasing [array names subgroups]]
+    foreach group $groups {
+        set grpid [overdb eval {SELECT rowid FROM groups WHERE name==$group}]
+        lappend grps $group $grpid
+    }
+} elseif {$grpat eq "archiveonly"} {
+    set grps [overdb eval {SELECT name,rowid FROM groups WHERE servers=="" ORDER BY name}]
+} else {
+    set grps [overdb eval {SELECT name,rowid FROM groups WHERE name GLOB $grpat ORDER BY name}]
+}
+
+proc writeit data {
+    overdb transaction {
+        foreach {rid num} $data {
+            overdb eval {UPDATE over SET num=$num WHERE rowid==$rid}
+        }
+    }
+}
+
+foreach {group gid} $grps {
+    puts $group
+    set count 0
+    set data {}
+    set rowids [overdb eval {SELECT rowid FROM over WHERE grpid==$gid ORDER BY dat}]
+    foreach rid $rowids {
+        lappend data $rid [incr count]
+        if {$count%100000 == 0} {
+            puts "$group $count"
+            writeit $data
+            set data {}
+        }
+    }
+    puts "$group $count"
+    writeit $data
+
+    overdb eval {UPDATE groups SET posts=$count WHERE name==$group}
+}
+
