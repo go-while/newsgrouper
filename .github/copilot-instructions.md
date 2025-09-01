@@ -1,4 +1,4 @@
-# AI Instructions for Newsgrouper
+# Copilot Instructions for Newsgrouper
 
 ## Project Overview
 
