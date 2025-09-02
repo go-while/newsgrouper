@@ -70,7 +70,7 @@ The workflows handle installation of:
 - Redis server (for container builds)
 - Optional: TclTls, compface, mboxgrep
 
-Note: The project requires Tcl 9.0 but Ubuntu 22.04 provides 8.6.14. This may need manual upgrade for full functionality.
+Note: The project requires Tcl 9.0. The workflows use Ubuntu 24.04 and automatically compile Tcl 9.0 from source, so no manual upgrade is needed.
 
 ## Configuration
 
