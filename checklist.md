@@ -16,11 +16,6 @@ This checklist provides actionable items for an AI agent to systematically addre
   - [ ] Validate and sanitize URL parameters before HTML output
   - [ ] Implement proper URL encoding for all link generation
 
-### Logic Errors
-- [ ] **Uninitialized Variable Bug** - `server/news_code.tcl` line 26
-  - [ ] Initialize variable `n` to 0 in `printvars` function before use
-  - [ ] Test debug function to ensure proper operation
-
 ## High Priority Issues (Fix Within 1 Week)
 
 ### Security Improvements
