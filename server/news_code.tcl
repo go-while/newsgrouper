@@ -38,12 +38,12 @@ proc heading params {
     dict with params {}
     html "<!doctype html>
     <head><style type='text/css'>
-    body {color:$gen_fg; background-color: $gen_bg; font-family: Verdana}
+    body {color:[validate_css_color $gen_fg]; background-color: [validate_css_color $gen_bg]; font-family: Verdana}
     .but {width: 8em;}
     .bbut {width: 10em;}
-    .new {color:$new_fg; background-color: $new_bg}
-    .rep {color:$rep_fg; background-color: $rep_bg}
-    .quot {color: $quo_fg; background-color: $quo_bg}
+    .new {color:[validate_css_color $new_fg]; background-color: [validate_css_color $new_bg]}
+    .rep {color:[validate_css_color $rep_fg]; background-color: [validate_css_color $rep_bg]}
+    .quot {color: [validate_css_color $quo_fg]; background-color: [validate_css_color $quo_bg]}
     .hide {color: red; text-decoration: none; font-size: x-small}
 </style></head>"
     html {
@@ -824,7 +824,7 @@ function setup() {
         if {$start_num == $prev_thread} {
             set id " id='sel'"
         }
-        html "<td><a$id href=$start_num$tail>[enpre $sub]</a></td>"
+        html "<td><a$id href='[html_attr_encode $start_num$tail]'>[enpre $sub]</a></td>"
 	html "<td>[enpre $name]"
         if {[tsv::exists Faces $addr]} {
             html " <img src='/face/[Url_Encode $addr].png' width='20' align='top' style='float: right'>\n"
@@ -1114,6 +1114,50 @@ proc enpre2 {str} {
     string map {& &amp; \" &quot;} $str
 }
 
+# Security utility functions for XSS prevention
+proc html_attr_encode {str} {
+    # Encode for HTML attribute context to prevent XSS
+    string map {< &lt; > &gt; & &amp; \" &quot; ' &#39; \r "" \n ""} $str
+}
+
+proc validate_url {url} {
+    # Validate URL to prevent javascript: and data: scheme attacks
+    set url [string trim $url]
+    if {$url eq ""} {return ""}
+    
+    # Block dangerous schemes
+    if {[regexp -nocase {^(javascript|data|vbscript):} $url]} {
+        return ""
+    }
+    
+    # Allow only http, https, ftp, and relative URLs
+    if {![regexp {^(https?://|ftp://|/|[^:/?#]+)} $url]} {
+        return ""
+    }
+    
+    return [html_attr_encode $url]
+}
+
+proc validate_css_color {color} {
+    # Validate CSS color values to prevent injection
+    set color [string trim $color]
+    if {$color eq ""} {return "#000000"}
+    
+    # Allow hex colors (#rgb, #rrggbb)
+    if {[regexp {^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$} $color]} {
+        return $color
+    }
+    
+    # Allow basic named colors
+    set safe_colors {red green blue yellow orange purple pink black white gray grey}
+    if {[string tolower $color] in $safe_colors} {
+        return [string tolower $color]
+    }
+    
+    # Default to black if invalid
+    return "#000000"
+}
+
 proc show_thread_arts {urec group thread target start} {
     foreach {num indent} $thread {
         prefetch nh art $group $num
@@ -1321,7 +1365,14 @@ proc markup_art_tokens {{recursed 0}} {
         html [enpre $pre_txt]
 
         switch $tok {
-            u { html "<a href='$tok_txt' target='_blank'>$tok_txt</a>" }
+            u { 
+                set safe_url [validate_url $tok_txt]
+                if {$safe_url ne ""} {
+                    html "<a href='$safe_url' target='_blank'>[enpre $tok_txt]</a>"
+                } else {
+                    html "[enpre $tok_txt]"
+                }
+            }
             e { if {$recursed} {return [list $tok_txt $html]}
                 html $tok_txt }
             b { lassign [markup_art_em_tokens $tok_txt] extra_end nested_html
@@ -1350,7 +1401,9 @@ proc markup_art_em_tokens unclosed {
         } {
             if {$c in $bl} {
                 if {$c in $el || $end eq {}} {
-                    set html [subst $out]
+                    # Safe template substitution - replace $html with actual content
+                    set safe_html [string map [list {$html} $html] $out]
+                    set html $safe_html
                 } else {
                     append unclosed $c
                 }
@@ -1945,7 +1998,7 @@ function setup() {
         if {$num eq $prev_result} {
             set id " id='sel'"
         }
-        html "<td><a$id href=$num>[enpre $sub]</a></td>"
+        html "<td><a$id href='[html_attr_encode $num]'>[enpre $sub]</a></td>"
 	html "<td>[enpre $frm]</td><td>$dat</td></tr>\n"
     }
     html "<tr><td/><td/><td>"

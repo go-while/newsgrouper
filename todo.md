@@ -6,26 +6,27 @@ This security review analyzes the Newsgrouper Tcl web application for input vali
 
 ## Critical Findings
 
-### 1. HTML Injection via Article Markup System (HIGH RISK)
+### 1. HTML Injection via Article Markup System (HIGH RISK) - FIXED ✅
 
 **Location:** `server/news_code.tcl` lines 1324, 1353
-**Issue:** The markup system for article formatting contains multiple XSS vulnerabilities:
+**Issue:** The markup system for article formatting contained multiple XSS vulnerabilities:
 
 ```tcl
-# Line 1324 - Direct URL output without validation
+# Line 1324 - Direct URL output without validation (FIXED)
 u { html "<a href='$tok_txt' target='_blank'>$tok_txt</a>" }
 
-# Line 1353 - Dangerous subst command with user content
+# Line 1353 - Dangerous subst command with user content (FIXED)
 set html [subst $out]
 ```
 
 **Risk:** Malicious NNTP articles can inject arbitrary HTML/JavaScript via URLs and markup tokens.
 **Impact:** Full XSS capability, session hijacking, data theft.
+**Fix Applied:** Added URL validation with scheme filtering and replaced dangerous `subst` with safe template processing.
 
-### 2. Unvalidated URL Parameters in Links (HIGH RISK)
+### 2. Unvalidated URL Parameters in Links (HIGH RISK) - FIXED ✅
 
 **Location:** `server/news_code.tcl` lines 827, 1948
-**Issue:** URL parameters are inserted directly into href attributes without validation:
+**Issue:** URL parameters were inserted directly into href attributes without validation:
 
 ```tcl
 # Line 827
@@ -37,11 +38,12 @@ html "<td><a$id href=$num>[enpre $sub]</a></td>"
 
 **Risk:** XSS via javascript: URLs, open redirects, and link manipulation.
 **Impact:** XSS, phishing attacks, malicious redirects.
+**Fix Applied:** Added HTML attribute encoding for all href values to prevent XSS injection.
 
-### 3. CSS Color Injection (MEDIUM RISK)
+### 3. CSS Color Injection (MEDIUM RISK) - FIXED ✅
 
 **Location:** `server/news_code.tcl` lines 41-46
-**Issue:** User preference colors are inserted directly into CSS without validation:
+**Issue:** User preference colors were inserted directly into CSS without validation:
 
 ```tcl
 body {color:$gen_fg; background-color: $gen_bg; font-family: Verdana}
@@ -49,6 +51,7 @@ body {color:$gen_fg; background-color: $gen_bg; font-family: Verdana}
 
 **Risk:** CSS injection allowing XSS via expression() or data: URLs.
 **Impact:** XSS in older browsers, UI manipulation.
+**Fix Applied:** Added CSS color validation with hex pattern and named color allowlisting.
 
 ### 4. Insufficient Input Validation in Forms (MEDIUM RISK)
 

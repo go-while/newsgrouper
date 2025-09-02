@@ -5,24 +5,24 @@ This checklist provides actionable items for an AI agent to systematically addre
 ## Critical Issues (Fix Immediately)
 
 ### Security Vulnerabilities
-- [ ] **HTML Injection via Article Markup System** - `server/news_code.tcl` lines 1324, 1353
-  - [ ] Add URL validation to `u` markup token processing (line 1324)
-  - [ ] Replace dangerous `subst` command with safe template processing (line 1353)
-  - [ ] Implement URL sanitization for href attributes
-  - [ ] Add XSS protection for user-controlled markup content
+- [x] **HTML Injection via Article Markup System** - `server/news_code.tcl` lines 1324, 1353
+  - [x] Add URL validation to `u` markup token processing (line 1324)
+  - [x] Replace dangerous `subst` command with safe template processing (line 1353)
+  - [x] Implement URL sanitization for href attributes
+  - [x] Add XSS protection for user-controlled markup content
 
-- [ ] **Unvalidated URL Parameters in Links** - `server/news_code.tcl` lines 827, 1948
-  - [ ] Add HTML attribute encoding for article numbers in href attributes
-  - [ ] Validate and sanitize URL parameters before HTML output
-  - [ ] Implement proper URL encoding for all link generation
+- [x] **Unvalidated URL Parameters in Links** - `server/news_code.tcl` lines 827, 1948
+  - [x] Add HTML attribute encoding for article numbers in href attributes
+  - [x] Validate and sanitize URL parameters before HTML output
+  - [x] Implement proper URL encoding for all link generation
 
 ## High Priority Issues (Fix Within 1 Week)
 
 ### Security Improvements
-- [ ] **CSS Color Injection** - `server/news_code.tcl` lines 41-46
-  - [ ] Add color value validation for user preferences
-  - [ ] Implement CSS value sanitization
-  - [ ] Use allowlist approach for acceptable color formats
+- [x] **CSS Color Injection** - `server/news_code.tcl` lines 41-46
+  - [x] Add color value validation for user preferences
+  - [x] Implement CSS value sanitization
+  - [x] Use allowlist approach for acceptable color formats
 
 - [ ] **Input Validation in Forms** - `server/news_code.tcl` line 2172
   - [ ] Enhance `field_encode` function with comprehensive validation
