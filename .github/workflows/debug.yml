@@ -31,9 +31,31 @@ jobs:
         
     - name: Install Tcl Environment
       run: |
-        echo "=== Installing Tcl environment ==="
+        echo "=== Installing build dependencies ==="
         sudo apt-get update
-        sudo apt-get install -y tcl tcl-dev tcllib tk sqlite3 redis-server
+        sudo apt-get install -y \
+            build-essential \
+            wget \
+            curl \
+            sqlite3 \
+            redis-server \
+            zlib1g-dev
+        
+        # Note: Removed tcl, tcl-dev, tcllib, tk packages since we compile Tcl 9.0 from source
+        # These Ubuntu packages are designed for system Tcl 8.6.x and conflict with Tcl 9.0
+        
+        echo "=== Compiling Tcl 9.0.2 from source ==="
+        cd /tmp
+        wget https://sourceforge.net/projects/tcl/files/Tcl/9.0.2/tcl9.0.2-src.tar.gz/download -O tcl9.0.2-src.tar.gz
+        tar -xzf tcl9.0.2-src.tar.gz
+        cd tcl9.0.2/unix
+        ./configure --enable-shared --enable-threads
+        make
+        sudo make install
+        sudo ldconfig
+        sudo ln -sf /usr/local/bin/tclsh9.0 /usr/local/bin/tclsh
+        cd /
+        rm -rf /tmp/tcl9.0.2*
         
         echo "=== Tcl version ==="
         echo 'puts [info patchlevel]; exit' | tclsh
