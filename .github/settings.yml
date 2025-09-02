@@ -2,10 +2,6 @@
 # This file configures repository-level settings for GitHub Copilot access
 
 repository:
-  # Enable GitHub Copilot access for this repository
-  # This allows collaborators with appropriate permissions to use Copilot
-  allow_copilot: true
-  
   # Repository visibility and access settings
   private: false
   

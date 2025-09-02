@@ -37,12 +37,13 @@ If this repository is part of an organization with Copilot access:
 
 ## Repository Configuration
 
-This repository is configured to support GitHub Copilot with:
+This repository is configured to support GitHub Copilot development with:
 
-- ✅ Copilot access enabled for collaborators
 - ✅ Comprehensive copilot instructions (see `.github/copilot-instructions.md`)
 - ✅ Repository settings optimized for collaborative development
-- ✅ Proper security settings that work with Copilot
+- ✅ Proper security settings that work with Copilot workflows
+
+**Note**: GitHub Copilot access is controlled by user/organization subscriptions, not repository settings. This repository provides optimal configuration and documentation for collaborators who have Copilot access through their GitHub subscription.
 
 ## Copilot Features Available
 
