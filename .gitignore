@@ -1,0 +1,48 @@
+# Build and distribution artifacts
+dist/
+*.tar.gz
+*.zip
+
+# Docker artifacts
+Dockerfile
+.dockerignore
+
+# Temporary files
+*.tmp
+*.swp
+*~
+.#*
+
+# Configuration files (keep samples)
+scripts/ng_config.tcl
+scripts/na_config.tcl
+scripts/nu_config.tcl
+
+# Data directories
+/data/
+/data2/
+
+# Log files
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# GitHub Actions artifacts
+.github/workflows/test-results/
