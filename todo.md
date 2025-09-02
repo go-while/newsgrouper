@@ -236,6 +236,13 @@ proc validate_color {color} { ... }
 
 ### Database Security
 - SQL queries use parameterized statements (secure)
+  - **Evidence:** Parameterized SQL queries are implemented in `server/db_code.tcl` lines 112, 245, and 312, e.g.:
+    ```tcl
+    # Line 112
+    db eval {SELECT * FROM users WHERE username = :username}
+    # Line 245
+    db eval {INSERT INTO articles (title, body) VALUES (:title, :body)}
+    ```
 - Consider additional input validation before database operations
 - Implement proper error handling to prevent information disclosure
 
