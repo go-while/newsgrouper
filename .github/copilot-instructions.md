@@ -182,6 +182,11 @@ Newsgrouper is a Tcl-based web interface to Usenet newsgroups that provides mode
 ## Security Considerations
 
 - **User Authentication**: SQLite-based with MD5 password hashing (MD5 is cryptographically insecure and vulnerable to rainbow table attacks; migration to a secure password hashing algorithm such as bcrypt, scrypt, or Argon2 is strongly recommended)
+  - **MD5 Usage Locations** requiring security updates:
+    - `server/news_code.tcl` lines 333-336: User login authentication using md5crypt
+    - `server/news_code.tcl` lines 372-376: Guest login cookie generation using md5crypt  
+    - `scripts/user_admin` lines 42, 89-90: User password creation using md5crypt
+    - Note: Current implementation uses `md5crypt::md5crypt` with salting, not plain MD5, but still vulnerable to attacks
 - **Session Management**: Redis-based session storage
 - **Input Validation**: Validate all user inputs in web forms
 - **Configuration**: Keep sensitive data in config files, not code
