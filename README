@@ -43,6 +43,14 @@ Other user-specific info like which groups they read is kept in Redis.
 
 The list of newsgroups and their descriptions is kept in Redis and needs to be initialised and updated by running scripts/newslist.  This also updates the statistics for global posting rates per group.
 
+Contributing and Development
+
+For contributors and developers interested in working on this project:
+
+- **GitHub Copilot Access**: See `.github/COPILOT_ACCESS.md` for information on accessing GitHub Copilot as a collaborator
+- **Development Guidelines**: Comprehensive development instructions are available in `.github/copilot-instructions.md`
+- **Issue Templates**: Use the provided issue templates for bug reports, feature requests, or Copilot access support
+
 License
 
 This software uses the ISC LICENSE:

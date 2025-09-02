@@ -1,0 +1,93 @@
+name: Copilot Access Support
+description: Request help with GitHub Copilot access in this repository
+title: "[COPILOT ACCESS] "
+labels: ["copilot", "access", "help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## GitHub Copilot Access Request
+        
+        Use this template if you're having trouble accessing GitHub Copilot in this repository.
+        
+        **Before submitting**, please check:
+        - [ ] You have read `.github/COPILOT_ACCESS.md`
+        - [ ] You have a valid GitHub Copilot subscription or organization access
+        - [ ] You have the required repository permissions (push access or higher)
+        - [ ] You have installed the GitHub Copilot extension in your IDE
+        
+  - type: dropdown
+    id: subscription-type
+    attributes:
+      label: Copilot Subscription Type
+      description: What type of GitHub Copilot access do you have?
+      options:
+        - Individual subscription
+        - Organization/Enterprise subscription
+        - I don't have a subscription
+        - I'm not sure
+    validations:
+      required: true
+      
+  - type: dropdown
+    id: access-level
+    attributes:
+      label: Repository Access Level
+      description: What level of access do you have to this repository?
+      options:
+        - Admin
+        - Maintain
+        - Push/Write
+        - Triage
+        - Pull/Read
+        - I'm not sure
+    validations:
+      required: true
+      
+  - type: input
+    id: ide
+    attributes:
+      label: Development Environment
+      description: Which IDE or editor are you using?
+      placeholder: "e.g., VS Code, JetBrains IntelliJ, Neovim, etc."
+    validations:
+      required: true
+      
+  - type: textarea
+    id: problem-description
+    attributes:
+      label: Problem Description
+      description: Describe the issue you're experiencing with Copilot access
+      placeholder: "e.g., Copilot suggestions not appearing, authentication errors, etc."
+    validations:
+      required: true
+      
+  - type: textarea
+    id: error-messages
+    attributes:
+      label: Error Messages
+      description: Include any error messages you're seeing
+      placeholder: "Paste any error messages here"
+    validations:
+      required: false
+      
+  - type: textarea
+    id: steps-taken
+    attributes:
+      label: Troubleshooting Steps Taken
+      description: What have you already tried to resolve this issue?
+      placeholder: "e.g., Reinstalled extension, re-authenticated, checked subscription status"
+    validations:
+      required: false
+      
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      description: Please confirm you've completed these steps
+      options:
+        - label: I have verified my GitHub Copilot subscription is active
+        - label: I have confirmed I have appropriate repository permissions  
+        - label: I have installed the latest version of the GitHub Copilot extension
+        - label: I have tried re-authenticating my GitHub account in the IDE
+        - label: I have read the project's Copilot documentation (.github/COPILOT_ACCESS.md)

@@ -1,0 +1,48 @@
+# Repository settings configuration
+# This file configures repository-level settings for GitHub Copilot access
+
+repository:
+  # Enable GitHub Copilot access for this repository
+  # This allows collaborators with appropriate permissions to use Copilot
+  allow_copilot: true
+  
+  # Repository visibility and access settings
+  private: false
+  
+  # Collaborator permissions
+  # These settings help define who can access Copilot features
+  has_issues: true
+  has_projects: true
+  has_wiki: true
+  
+  # Security and analysis features
+  # Enable security features that work well with Copilot
+  security_and_analysis:
+    secret_scanning:
+      status: enabled
+    secret_scanning_push_protection:
+      status: enabled
+
+# Team and collaborator permissions
+# Note: This section may need to be customized based on your organization structure
+teams:
+  # Example team configuration - adjust as needed
+  - name: "maintainers"
+    permission: "admin"
+  - name: "contributors" 
+    permission: "push"
+
+# Branch protection rules that work well with Copilot workflows
+branches:
+  - name: "main"
+    protection:
+      required_status_checks:
+        strict: true
+        contexts: []
+      enforce_admins: false
+      required_pull_request_reviews:
+        required_approving_review_count: 1
+        dismiss_stale_reviews: true
+        require_code_owner_reviews: false
+        require_last_push_approval: false
+      restrictions: null
