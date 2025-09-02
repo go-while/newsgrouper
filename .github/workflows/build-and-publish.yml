@@ -29,8 +29,8 @@ jobs:
         sudo apt-get install -y tcl-tls || echo "tcl-tls not available"
         sudo apt-get install -y compface mboxgrep || echo "optional packages not available"
         
-        # Check Tcl version
-        echo "Tcl version:"
+        # Check Tcl version (Note: Build environment uses system Tcl 8.6.x, containers get Tcl 9.0)
+        echo "Tcl version in build environment:"
         echo 'puts [info patchlevel]; exit' | tclsh
         
     - name: Syntax check Tcl files
@@ -195,23 +195,41 @@ jobs:
     - name: Create Dockerfile
       run: |
         cat > Dockerfile << 'EOF'
-        FROM ubuntu:22.04
+        FROM ubuntu:24.04
         
         # Avoid interactive prompts during installation
         ENV DEBIAN_FRONTEND=noninteractive
         
-        # Install dependencies
+        # Install build dependencies and runtime dependencies
         RUN apt-get update && apt-get install -y \
-            tcl \
-            tcl-dev \
-            tcllib \
-            tk \
+            build-essential \
+            wget \
+            curl \
             sqlite3 \
             redis-server \
-            curl \
-            && apt-get install -y tcl-tls || echo "tcl-tls not available" \
+            zlib1g-dev \
             && apt-get install -y compface || echo "compface not available" \
             && apt-get install -y mboxgrep || echo "mboxgrep not available" \
+            && rm -rf /var/lib/apt/lists/*
+            
+        # Download and compile Tcl 9.0.2 from source
+        RUN cd /tmp \
+            && wget https://sourceforge.net/projects/tcl/files/Tcl/9.0.2/tcl9.0.2-src.tar.gz/download -O tcl9.0.2-src.tar.gz \
+            && tar -xzf tcl9.0.2-src.tar.gz \
+            && cd tcl9.0.2/unix \
+            && ./configure --enable-shared --enable-threads \
+            && make \
+            && make install \
+            && ldconfig \
+            && cd / \
+            && rm -rf /tmp/tcl9.0.2* \
+            && ln -sf /usr/local/bin/tclsh9.0 /usr/local/bin/tclsh
+            
+        # Install Tcllib and other Tcl packages
+        RUN apt-get update && apt-get install -y \
+            tcllib \
+            tk \
+            && apt-get install -y tcl-tls || echo "tcl-tls not available" \
             && rm -rf /var/lib/apt/lists/*
             
         # Create app directory and user
@@ -291,7 +309,7 @@ jobs:
           3. Or use the container image: `docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
           
           ### Requirements
-          - Tcl 9.0 (currently requires manual upgrade from 8.6.x)
+          - Tcl 9.0 (included in container image)
           - Redis server
           - NNTP server access
           - See README for complete dependency list
