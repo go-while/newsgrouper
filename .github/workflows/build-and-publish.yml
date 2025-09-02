@@ -225,12 +225,9 @@ jobs:
             && rm -rf /tmp/tcl9.0.2* \
             && ln -sf /usr/local/bin/tclsh9.0 /usr/local/bin/tclsh
             
-        # Install Tcllib and other Tcl packages
-        RUN apt-get update && apt-get install -y \
-            tcllib \
-            tk \
-            && apt-get install -y tcl-tls || echo "tcl-tls not available" \
-            && rm -rf /var/lib/apt/lists/*
+        # Note: tcllib, tk, and tcl-tls packages removed since we compiled Tcl 9.0 from source
+        # These Ubuntu packages are designed for system Tcl 8.6.x and may not work with Tcl 9.0
+        # Required Tcl packages (sqlite3, mime, etc.) will be installed separately if needed
             
         # Create app directory and user
         RUN useradd -m -s /bin/bash newsgrouper
