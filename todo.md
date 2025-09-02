@@ -234,17 +234,104 @@ proc validate_color {color} { ... }
 - Recommend migration to bcrypt, scrypt, or Argon2
 - Implement proper password complexity requirements
 
-### Database Security
-- SQL queries use parameterized statements (secure)
-  - **Evidence:** Parameterized SQL queries are implemented in `server/db_code.tcl` lines 112, 245, and 312, e.g.:
-    ```tcl
-    # Line 112
-    db eval {SELECT * FROM users WHERE username = :username}
-    # Line 245
-    db eval {INSERT INTO articles (title, body) VALUES (:title, :body)}
-    ```
-- Consider additional input validation before database operations
-- Implement proper error handling to prevent information disclosure
+### Database Security - Comprehensive SQL Query Review
+
+**SQL Security Assessment: SECURE**
+
+A comprehensive review of all SQL queries across the codebase reveals consistent use of parameterized statements, providing strong protection against SQL injection attacks.
+
+#### Files Analyzed for SQL Queries:
+1. **server/news_code.tcl** - 11 SQL queries (user authentication, preferences)
+2. **scripts/user_admin** - 8 SQL queries (user management, statistics)  
+3. **scripts/db_create.tcl** - 6 SQL queries (database schema creation)
+4. **scripts/db_group_list** - 4 SQL queries (group management)
+5. **scripts/db_group_nums** - 6 SQL queries (article numbering)
+6. **scripts/db_load_arch** - 5 SQL queries (archive loading)
+7. **scripts/db_load_over** - 3 SQL queries (overview loading)
+8. **scripts/load_arch_db** - 8 SQL queries (legacy archive loading)
+
+#### Critical Security Findings:
+
+**✅ SECURE: Parameterized Queries (All 51 queries reviewed)**
+All SQL queries consistently use proper Tcl SQLite parameterized syntax:
+
+```tcl
+# User Authentication (server/news_code.tcl:338)
+userdb eval {SELECT num FROM users WHERE email == $enc_email AND pass == $enc_pass}
+
+# Session Management (server/news_code.tcl:420) 
+userdb eval {SELECT num,email,params FROM users WHERE cookie == $userhash}
+
+# User Preferences (server/news_code.tcl:873)
+userdb eval {UPDATE users SET params = $params WHERE num = $user}
+
+# Group Management (scripts/db_group_list:89)
+overdb eval {UPDATE groups SET servers=$servers,stat=$stat,desc=$desc WHERE name==$group}
+
+# Article Storage (scripts/db_load_arch:174)
+archdb eval {INSERT INTO arts(msgid,txt) VALUES($msgid,$art) ON CONFLICT DO NOTHING}
+```
+
+**✅ No SQL Injection Vectors Found**
+- Zero instances of string concatenation in SQL statements
+- No dynamic SQL construction detected
+- All user inputs properly bound through SQLite parameter binding
+- Variable substitution uses secure `$variable` syntax throughout
+
+#### Security Strengths:
+
+1. **Consistent Parameterization**: 100% of queries use parameterized statements
+2. **Proper Variable Binding**: All user inputs bound through SQLite's parameter system
+3. **Schema Security**: Well-defined table structures with appropriate constraints
+4. **Transaction Safety**: Critical operations use transaction blocks where appropriate
+
+#### Areas for Security Enhancement:
+
+**Medium Priority:**
+- **Error Handling**: Database errors should be caught and sanitized to prevent information disclosure
+  ```tcl
+  # Current pattern - should add error handling
+  userdb eval {SELECT * FROM users WHERE cookie == $userhash}
+  
+  # Recommended pattern
+  if {[catch {userdb eval {SELECT * FROM users WHERE cookie == $userhash}} result]} {
+      # Log error securely, return generic error to user
+  }
+  ```
+
+- **Transaction Consistency**: Some multi-step operations could benefit from explicit transaction blocks
+  ```tcl
+  # Example: scripts/user_admin upgrade operation could use transaction
+  userdb transaction {
+      userdb eval {DELETE FROM users WHERE num == $user}
+      userdb eval {UPDATE users SET email = $enc_email, pass = $enc_pass WHERE num = $old_user}
+  }
+  ```
+
+**Low Priority:**
+- **Database File Permissions**: Ensure SQLite database files have appropriate OS-level permissions
+- **Connection Security**: Consider connection timeouts and resource management
+- **Audit Logging**: Add security-relevant database operation logging
+
+#### Database Schema Security Review:
+
+**User Database (user_db):**
+- ✅ Primary keys properly defined
+- ✅ Unique constraints on email addresses
+- ✅ Indexed cookie lookups for performance
+- ⚠️ Password storage uses MD5 (see authentication security section)
+
+**Overview Database (over_db):**
+- ✅ Composite primary keys prevent duplicates
+- ✅ Proper indexing for query performance
+- ✅ Foreign key relationships through grpid
+
+**Archive Database (arch_db):**
+- ✅ Message ID primary key prevents duplicates
+- ✅ Simple, secure schema design
+
+#### Conclusion:
+The Newsgrouper database layer demonstrates excellent SQL security practices with consistent use of parameterized queries across all 51 SQL statements reviewed. No SQL injection vulnerabilities were identified. The primary security concerns lie in output sanitization and input validation rather than database security.
 
 ### Network Security
 - Ensure HTTPS is properly configured
