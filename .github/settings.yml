@@ -23,14 +23,12 @@ repository:
     secret_scanning_push_protection:
       status: enabled
 
-# Team and collaborator permissions
-# Note: This section may need to be customized based on your organization structure
-teams:
-  # Example team configuration - adjust as needed
-  - name: "maintainers"
-    permission: "admin"
-  - name: "contributors" 
-    permission: "push"
+# Collaborator permissions
+collaborators:
+  - username: cgmacleod
+    permission: admin
+  - username: go-while
+    permission: admin
 
 # Branch protection rules that work well with Copilot workflows
 branches:
@@ -39,7 +37,7 @@ branches:
       required_status_checks:
         strict: true
         contexts: []
-      enforce_admins: false
+      enforce_admins: true
       required_pull_request_reviews:
         required_approving_review_count: 1
         dismiss_stale_reviews: true
