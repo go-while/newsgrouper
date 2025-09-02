@@ -55,7 +55,7 @@ jobs:
           fi
           
           # Basic syntax check using Tcl's info complete
-          if echo "info complete [cat \"$file\" | sed 's/\\/\\\\/g' | sed 's/\"/\\\"/g']" | tclsh > /dev/null 2>&1; then
+          if echo "info complete [$(cat "$file" | sed 's/\\/\\\\/g' | sed 's/\"/\\\"/g')]" | tclsh > /dev/null 2>&1; then
             echo "✓ $file: syntax OK"
           else
             # For files that might have dependencies, just check they're valid text
