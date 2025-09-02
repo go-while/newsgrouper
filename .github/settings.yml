@@ -21,8 +21,6 @@ repository:
 
 # Collaborator permissions
 collaborators:
-  - username: cgmacleod
-    permission: admin
   - username: go-while
     permission: admin
 
