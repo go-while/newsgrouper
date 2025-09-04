@@ -134,7 +134,7 @@ proc main {sock suffix} {
         html [do_msgid_search $urec $sock] }
     {^search$} {
         html [do_group_search $urec $sock] }
-    {^<[[:graph:]]+@[[:graph:]]+>$} {
+    {^%3C[[:graph:]]+@[[:graph:]]+%3E$} {
         html [do_msgid_art $urec $sock $suffix] }
     default {
         html "<br/>'$suffix' - THAT DOES NOT COMPUTE."
@@ -169,7 +169,7 @@ proc dispatch_group {urec sock group rest} {
         html [show_group $sock $urec $group $num] }
     {^/post$} {
         html [compose_new $urec $group] }
-    {^/search/do$} {
+    {^/search/list$} {
         html [show_art_search $sock $urec $group] }
     {^/search/(\d+)$} {
         lassign $num_etc - num
@@ -577,7 +577,7 @@ proc do_group_search {urec sock} {
 # Show the form to search for for a message by its id
 proc show_msgid_search {} {
     html {
-<h4>Find an article by message-id</h4>
+<h3>Find an article by message-id</h3>
 
 <form action='/msgid' method='post'>
 Message-Id: <em>(this has the form &lt;random-stuff@some.site&gt;)</em>
@@ -600,7 +600,7 @@ proc do_msgid_search {urec sock} {
         return "$html<h4>Invalid message-id.</h4>"
     }
 
-    if [catch {get nh mid $msgid} art] {
+    if {[catch {get nh mid $msgid} art]} {
         return "$html<h4>Article Not Found.</h4>"
     }
     lassign [parse_article $art] headers body
@@ -609,7 +609,7 @@ proc do_msgid_search {urec sock} {
 
 proc do_msgid_art {urec sock msgid} {
     set msgid [Url_Decode $msgid]
-    if [catch {get nh mid $msgid} art] {
+    if {[catch {get nh mid $msgid} art]} {
         return "$html<h4>Article Not Found.</h4>"
     }
     lassign [parse_article $art] headers body
@@ -618,7 +618,7 @@ proc do_msgid_art {urec sock msgid} {
 
 proc other_info {} {
     html {<h3><a href='/tops'>Guide to the most active groups</a></h3>}
-    html {<h3 style='background-color: lightgreen'>New Support Group for this site: 
+    html {<h3>Support Group for this site: 
     <a href='/newsgrouper.support'>newsgrouper.support</a></h3>
     }
 }
@@ -754,7 +754,7 @@ function setup() {
         html {disabled='disabled' }
     }
     html "/> <input type=submit value='Search \U01F50D' class='but' "
-    html "formaction='/$group/search/do' />\n"
+    html "formaction='/$group/search/list' />\n"
 
     html {<input type=submit value='Group Charter' class='but' }
     html "formaction='/$group/charter' />\n"
@@ -769,7 +769,7 @@ function setup() {
     set first [lindex $hdrs 0]
     set last [lindex $hdrs end-1]
 
-    set old_last [prev_last $user $group $last]
+    update_last $user $group $last
 
     html {
 <table style='table-layout: fixed; width:100%;' >
@@ -850,16 +850,15 @@ function setup() {
     return $html
 }
 
-# Get number of the last article when user previously read this group
-proc prev_last {user group {last 0}} {
+# Update number of the last article when user previously read this group
+proc update_last {user group last} {
     # Article numbers after the ugrp old_last value will be considered new.
     # If the ugrp record does not already have a new_last value, set it.
     set ugrp [redis hget "ugrp $user" $group]
     lassign $ugrp old_last new_last
-    if {$new_last eq {} && $last > 0} {
+    if {$new_last eq {} && $last ne {}} {
         redis hset "ugrp $user" $group [list $old_last $last]
     }
-    return $old_last
 }
 
 # Reverse the display order of threads in a group
@@ -877,7 +876,7 @@ proc reverse_group {sock urec group} {
 
 # Show one discussion thread
 proc show_thread {urec group start target insearch} {
-    if [catch {get nh art $group $start} art] {
+    if {[catch {get nh art $group $start} art]} {
 	set sub {}
     } else {
         lassign [parse_article $art] headers body
@@ -896,7 +895,7 @@ proc show_thread {urec group start target insearch} {
 
     html {<iframe style='position:fixed; right:0%; bottom:0%; height:80%; width:69%' }
     lassign $urec user can_post params
-    if [dict get $params apt] {
+    if {[dict get $params apt]} {
         set art_html [show_thread_arts $urec $group $thread $target $start]
     } else {
         set art_html [get_article $urec $group $target $start $linx]
@@ -1017,7 +1016,7 @@ function setup() {
     foreach {num indent} $thread {
         if {$indent < $prev_ind} {
             html {<tr style='height:6px'>} \
-	        "<td colspan='[expr {30-1-$indent}]' class='rb'></td>" \
+	        "<td colspan='[expr {max(30-1-$indent,1)}]' class='rb'></td>" \
 	        [string repeat {<td class='r'></td>} [expr {$indent+1}]] "</tr>\n"
 	}
 
@@ -1079,7 +1078,7 @@ function setup() {
             html "disabled='disabled' />"
         }
         html "\n<input type=submit value='Back to Search results' class='bbut' "
-        html "formaction='/$group/search/do' />"
+        html "formaction='/$group/search/list' />"
     } else {
         html "\n<input type=submit value='Next Thread' class='bbut' "
         if {$next_thread} {
@@ -1130,7 +1129,7 @@ proc show_thread_arts {urec group thread target start} {
 
 # Generate an article display - this will be put in an iframe
 proc get_article {urec group num thr linx} {
-    if [catch {get nh art $group $num} art] {
+    if {[catch {get nh art $group $num} art]} {
         return "ARTICLE NOT FOUND: [enpre $art]"
     }
     lassign $urec user can_post params
@@ -1263,7 +1262,7 @@ proc show_article {urec headers body} {
             html "[markup_art_line $line]\n"
         } else {
 	    # make URLs clickable, encode <>
-	    set url_re {https?://[[:alnum:]\-;,/?:@&=+$_.!~*'()#%]+}
+	    set url_re {https?://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+}
 	    set line [regsub -all $url_re $line "\x01&\x02"]
 	    set line [enpre $line]
 	    set line [regsub -all {\x01([[:graph:]]+)\x02} $line {<a href='\1' target='_blank'>\1</a>}]
@@ -1283,7 +1282,7 @@ proc markup_art_line line {
     # First tokenise line into a list of triples:
     # text before the token, token type, text of the token.
     # Token types are url, begin-emphasis, end-emphasis.
-    set url_re {(https?://[[:alnum:]\-;,/?:@&=+$_.!~*'()#%]+)}
+    set url_re {(https?://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+)}
     set begin_emp_re {(?:(?:\A|\s)([*/_]+)[[:alnum:]])}
     set end_emp_re {(?:[[:alnum:]]([*/_]+)(?:\Z|\s))}
     set re "$url_re|$begin_emp_re|$end_emp_re"
@@ -1643,6 +1642,12 @@ proc save_prefs {urec sock} {
     lassign $urec user can_post
     upvar #0 Httpd$sock data
     set query [Url_DecodeQuery $data(query)]
+    # Check colour settings are not something dodgy
+    foreach field {gen_bg gen_fg new_bg new_fg rep_bg rep_fg sel_bg sel_fg quo_bg quo_fg} {
+        if {[regexp {[^[:alnum:]#]} [dict getdef $query $field {}]]} { 
+	    return "<br/><em>Save failed: bad data in '$field'.</em>"
+	}
+    }
     foreach field {blocks groups} {
         if {! [dict exists $query $field]} {
 	    return "<br/><em>Save failed: '$field' missing.</em>"
@@ -1906,7 +1911,7 @@ function setup() {
 </script>
 }
     html {
-<form action='do' method='post'>
+<form action='list' method='post'>
 <span style='float: right'>
 <input type='submit' value='Search' name='search' class='but' />
 <input type='submit' value='Clear' name='clear' class='but' />
@@ -2050,7 +2055,7 @@ proc form_field {label name value} {
 
 # Start a post in reply to an existing article
 proc compose_reply {urec group num} {
-    if [catch {get nh art $group $num} art] {
+    if {[catch {get nh art $group $num} art]} {
         return {Post not found.}
     }
     lassign [parse_article $art] headers old_body
@@ -2327,12 +2332,12 @@ proc parse_article {art} {
     regsub -all -line {^Content-Transfer-Encoding:\s+8-bit\s*$} $art \
         {Content-Transfer-Encoding: 8bit} art
 
-    if [catch {::mime::initialize -string $art} mt] {
+    if {[catch {::mime::initialize -string $art} mt]} {
         #puts "::mime::initialize FAILED: '$mt'"
         tailcall parse_article_a $art
         #return {}
     }
-    if [catch {::mime::getheader $mt} headers] {
+    if {[catch {::mime::getheader $mt} headers]} {
         puts "::mime::getheader FAILED: '$headers'"
         return [list {} $art]
     }
@@ -2344,8 +2349,8 @@ proc parse_article {art} {
         set bt $mt
     }
 
-    if [catch {::mime::getbody $bt -decode} body] {
-        if [catch {::mime::getbody $bt} body2] {
+    if {[catch {::mime::getbody $bt -decode} body]} {
+        if {[catch {::mime::getbody $bt} body2]} {
             set body "ERROR \"$body2\" in ::mime::getbody"
         } else {
             set body "ERROR \"$body\" while decoding:\n\n$body2"
@@ -2390,7 +2395,7 @@ tsv::set Faces {} {}
 # txt is the whole article.
 proc send_nntp txt {
     set txt [encoding convertto $txt]
-    if [catch {get ng post $txt} result] {
+    if {[catch {get ng post $txt} result]} {
         return "Posting Failed: $result"
     } else {
         return "Posting Succeeded."
