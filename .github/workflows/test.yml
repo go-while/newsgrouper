@@ -1,0 +1,133 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Tcl environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+            build-essential \
+            wget \
+            sqlite3 \
+            zlib1g-dev
+        
+        # Note: Removed tcl, tcl-dev, tcllib, tk, tcl-tls packages since we compile Tcl 9.0 from source
+        # These Ubuntu packages are designed for system Tcl 8.6.x and conflict with Tcl 9.0
+        
+        # Install optional non-Tcl packages
+        sudo apt-get install -y compface mboxgrep || echo "Some optional packages not available"
+        
+        echo "=== Compiling Tcl 9.0.2 from source ==="
+        cd /tmp
+        wget https://sourceforge.net/projects/tcl/files/Tcl/9.0.2/tcl9.0.2-src.tar.gz/download -O tcl9.0.2-src.tar.gz
+        tar -xzf tcl9.0.2-src.tar.gz
+        cd tcl9.0.2/unix
+        ./configure --enable-shared --enable-threads
+        make
+        sudo make install
+        sudo ldconfig
+        sudo ln -sf /usr/local/bin/tclsh9.0 /usr/local/bin/tclsh
+        cd /
+        rm -rf /tmp/tcl9.0.2*
+        
+        # Check Tcl version
+        echo "Tcl version:"
+        echo 'puts [info patchlevel]; exit' | tclsh
+        
+    - name: Validate Tcl files
+      run: |
+        echo "Checking Tcl files..."
+        find . -name "*.tcl" -type f -print0 | while IFS= read -r -d '' file; do
+          echo "Checking: $file"
+          
+          if [ ! -r "$file" ]; then
+            echo "✗ $file: not readable"
+            exit 1
+          fi
+          
+          if [ ! -s "$file" ]; then
+            echo "Warning: $file is empty"
+            continue
+          fi
+          
+          if file "$file" | grep -q "text"; then
+            echo "✓ $file: valid text file"
+          else
+            echo "✗ $file: invalid file format"
+            exit 1
+          fi
+        done
+        
+    - name: Validate scripts
+      run: |
+        echo "Checking executable scripts..."
+        for script in scripts/newsgetter scripts/newsutility scripts/newshub scripts/user_admin start; do
+          if [ -f "$script" ]; then
+            echo "✓ $script exists"
+            if [ -x "$script" ]; then
+              echo "✓ $script is executable"
+            else
+              echo "⚠ $script is not executable (may need chmod +x)"
+            fi
+            
+            # Check shebang line
+            if head -1 "$script" | grep -q "tclsh\|tcl"; then
+              echo "✓ $script has valid Tcl shebang"
+            else
+              echo "ℹ $script may not have Tcl shebang"
+            fi
+          else
+            echo "⚠ $script not found"
+          fi
+        done
+        
+    - name: Check configuration samples
+      run: |
+        echo "Checking configuration samples..."
+        for config in scripts/ng_config.tcl.sample scripts/na_config.tcl.sample scripts/nu_config.tcl.sample; do
+          if [ -f "$config" ]; then
+            echo "✓ $config exists"
+            if file "$config" | grep -q "text"; then
+              echo "✓ $config is a text file"
+            fi
+          else
+            echo "⚠ $config not found"
+          fi
+        done
+        
+    - name: Verify project structure
+      run: |
+        echo "Checking project structure..."
+        required_dirs=("scripts" "server" "htdocs")
+        required_files=("README" "LICENSE" "start")
+        
+        for dir in "${required_dirs[@]}"; do
+          if [ -d "$dir" ]; then
+            echo "✓ Directory $dir exists"
+            echo "  Files in $dir: $(ls -1 $dir | wc -l)"
+          else
+            echo "✗ Required directory $dir missing"
+            exit 1
+          fi
+        done
+        
+        for file in "${required_files[@]}"; do
+          if [ -f "$file" ]; then
+            echo "✓ File $file exists"
+          else
+            echo "⚠ Expected file $file not found"
+          fi
+        done
+        
+        echo "✓ Project structure validation completed"

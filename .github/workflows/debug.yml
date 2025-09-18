@@ -1,0 +1,149 @@
+name: Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug output'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: System Information
+      run: |
+        echo "=== System Information ==="
+        uname -a
+        echo ""
+        echo "=== Available Tcl packages ==="
+        apt-cache search tcl | grep -E '^tcl' | head -10
+        echo ""
+        echo "=== Current directory contents ==="
+        ls -la
+        echo ""
+        
+    - name: Install Tcl Environment
+      run: |
+        echo "=== Installing build dependencies ==="
+        sudo apt-get update
+        sudo apt-get install -y \
+            build-essential \
+            wget \
+            curl \
+            sqlite3 \
+            redis-server \
+            zlib1g-dev
+        
+        # Note: Removed tcl, tcl-dev, tcllib, tk packages since we compile Tcl 9.0 from source
+        # These Ubuntu packages are designed for system Tcl 8.6.x and conflict with Tcl 9.0
+        
+        echo "=== Compiling Tcl 9.0.2 from source ==="
+        cd /tmp
+        wget https://sourceforge.net/projects/tcl/files/Tcl/9.0.2/tcl9.0.2-src.tar.gz/download -O tcl9.0.2-src.tar.gz
+        tar -xzf tcl9.0.2-src.tar.gz
+        cd tcl9.0.2/unix
+        ./configure --enable-shared --enable-threads
+        make
+        sudo make install
+        sudo ldconfig
+        sudo ln -sf /usr/local/bin/tclsh9.0 /usr/local/bin/tclsh
+        cd /
+        rm -rf /tmp/tcl9.0.2*
+        
+        echo "=== Tcl version ==="
+        echo 'puts [info patchlevel]; exit' | tclsh
+        
+        echo "=== Available Tcl packages ==="
+        echo 'puts [lsort [package names]]; exit' | tclsh | tr ' ' '\n' | head -20
+        
+    - name: Examine Project Structure
+      run: |
+        echo "=== Project structure ==="
+        find . -type f -name "*.tcl" | head -10
+        echo ""
+        echo "=== Script files ==="
+        ls -la scripts/ | head -10
+        echo ""
+        echo "=== Server files ==="
+        ls -la server/
+        echo ""
+        echo "=== Start script ==="
+        cat start
+        echo ""
+        
+    - name: Debug File Content
+      if: ${{ inputs.debug_mode }}
+      run: |
+        echo "=== Sample configuration files ==="
+        for config in scripts/*.sample; do
+          if [ -f "$config" ]; then
+            echo "--- $config (first 10 lines) ---"
+            head -10 "$config"
+            echo ""
+          fi
+        done
+        
+        echo "=== Key script shebangs ==="
+        for script in scripts/newsgetter scripts/newsutility scripts/user_admin; do
+          if [ -f "$script" ]; then
+            echo "$script: $(head -1 "$script")"
+          fi
+        done
+        
+    - name: Test Tcl Syntax Advanced
+      run: |
+        echo "=== Advanced Tcl syntax testing ==="
+        
+        # Try to load each Tcl file in isolation
+        for file in $(find . -name "*.tcl" -type f | head -5); do
+          echo "Testing $file..."
+          
+          # Check if file can be parsed (not executed)
+          if tclsh -c "
+            set fd [open \"$file\" r]
+            set content [read \$fd]
+            close \$fd
+            
+            # Try to parse as Tcl list to check basic syntax
+            if {[catch {llength \$content}]} {
+              puts \"$file: May have syntax issues\"
+            } else {
+              puts \"$file: Basic syntax appears valid\"
+            }
+          " 2>/dev/null; then
+            echo "✓ $file processed successfully"
+          else
+            echo "⚠ $file had issues"
+          fi
+        done
+        
+    - name: Create Test Package
+      run: |
+        echo "=== Creating test package ==="
+        mkdir -p debug-output
+        
+        # Package without git files
+        tar -czf debug-output/newsgrouper-debug.tar.gz \
+          --exclude='.git*' \
+          --exclude='debug-output' \
+          .
+          
+        # Create manifest
+        find . -type f ! -path './.git/*' ! -path './debug-output/*' | sort > debug-output/file-manifest.txt
+        
+        echo "Package size: $(du -h debug-output/newsgrouper-debug.tar.gz)"
+        echo "Files included: $(wc -l < debug-output/file-manifest.txt)"
+        
+    - name: Upload Debug Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: debug-output
+        path: debug-output/
+        retention-days: 7
