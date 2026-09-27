@@ -38,19 +38,18 @@ namespace eval distcl {
 # service - name of the service being provided;
 # proc - command to call to process the request and return its value.
 # id - optional identifier for this service instance.
-proc serve {redis service proc {id {}}} {
+proc serve {redis service proc {idlesecs 300} {idleproc {}}} {
     set reqqueue q:$service
     set prequeue p:$service
-    if {$id eq {}} {set id [pid]}
-    set ctlqueue z:$id
+    set ctlqueue z:[pid]
     puts stderr "Control queue is '$ctlqueue'"
     set verbose 0
 
     while 1 {
         # wait for a request to appear on one of the queues
-        set qreq [$redis -sync blpop $ctlqueue $reqqueue $prequeue 300]
+        set qreq [$redis -sync blpop $ctlqueue $reqqueue $prequeue $idlesecs]
         if {$qreq eq "(nil)"} {
-            # keep things alive?
+            if {$idleproc ne {}} $idleproc
             continue
         }
         lassign $qreq queue request
@@ -111,10 +110,17 @@ proc serve {redis service proc {id {}}} {
 
 # Request the data computed by service for these arguments.
 #
+# -coro - if present, yield to other coroutines when waiting;
 # redis - a retcl connection to Redis, authenticated if necessary;
 # service - name of the service to call;
 # args - one or more arguments to pass to the service.
 proc get {redis service args} {
+    set do_coro 0
+    if {$redis eq "-coro"} {
+        set do_coro 1
+        set redis $service
+        set args [lassign $args service]
+    }
     set key v:${service}:$args
     # try to read the data from the cache
     set res [$redis -sync get $key]
@@ -123,7 +129,13 @@ proc get {redis service args} {
         $redis -sync rpush q:$service $args
 
         # wait for the data to be returned in the waitlist
-        set qres [$redis -sync blpop w:${service}:$args 20]
+        set coro [info coroutine]
+        if {!$do_coro || $coro eq {}} {
+            set qres [$redis -sync blpop w:${service}:$args 20]
+        } else {
+            $redis -cb [list ::distcl::getCallback $coro] blpop w:${service}:$args 20
+            set qres [yield]
+        }
         # if 20 second timeout expired, report error
         if {$qres eq "(nil)"} {error "Request for '$key' timed out."}
         set res [lindex $qres 1]
@@ -133,6 +145,10 @@ proc get {redis service args} {
     set status [string index $res 0]
     set value [string range $res 2 end]
     return -code $status $value
+}
+
+proc getCallback {coro id type value} {
+    after idle $coro [list $value]
 }
 
 # Request that a data item be precomputed as it will soon be needed.

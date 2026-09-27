@@ -10,7 +10,7 @@ package require sqlite3
 sqlite3 overdb /data/news_over.db
 overdb timeout 60000
 
-source ng_config.tcl
+source config.tcl
 #source retcl.tm ;# for local hacks
 package require retcl
 retcl create redis
@@ -59,6 +59,7 @@ puts "Total [array size sources] groups found."
 #puts [info exists descs(comp.lang.tcl.announce)]
 #exit
 
+redis -sync del newposts
 set newgroups 0
 foreach group [array names sources] {
     if {[incr progress] % 1000 == 0} {puts -nonewline .; flush stdout}
@@ -91,12 +92,12 @@ foreach group [array names sources] {
     # Also record how many new posts each group has
     set old_stat [redis -sync hget groupstats.2 $group]
     if {$old_stat == "(nil)"} {
-        set old_top 0
+        set old_top $top
         incr newgroups
     } else {
         set old_top [lindex $old_stat 1]
     }
-    if {! [string is integer -strict $old_top]} {set old_top 0}
+    if {! [string is integer -strict $old_top]} {set old_top $top}
     set newposts [expr {$top - $old_top}]
     redis -sync zadd newposts $newposts $group
 }

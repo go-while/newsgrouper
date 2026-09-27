@@ -1,43 +1,72 @@
 # Newsgrouper - a web interface to Usenet.
 
-set ng_version 0.8.1
+set ng_version 0.9.0
 
 package require Tcl 9.0
 package require mime
+package require sqlite3
+package require cmdline
 
-source scripts/retcl.tm
 source scripts/nntp.tcl
 #source scripts/reactcl.tcl
+source scripts/config.tcl
+source scripts/utils.tcl
+source scripts/captcha.tcl
+
+::tcl::tm::path add scripts
+package require wibbly
+package require retcl
 source scripts/distcl.tcl
-source scripts/ng_config.tcl
 
 # The back-end "newsgetter" process(es) provide "ng" and "na" services via distcl
-catch { retcl create redis }
-redis -async
-interp alias {} get {} distcl::get redis
+set redis [retcl new] ;# TODO options
+$redis -async
+interp alias {} get {} distcl::get -coro redis
 interp alias {} prefetch {} distcl::prefetch redis
 interp alias {} html {} append html
+proc tmpl {var body} {
+    upvar 1 $var html
+    append html [uplevel 1 ::wibbly::template [list $body]]
+}
 
-Url_PrefixInstall / main
+sqlite3 overdb $over_db -fullmutex 1
+overdb timeout 20000
 
-# a little debugging helper
-proc printvars args {
-    foreach var $args {
-        upvar $var pv[incr n]
-	if {[info exists pv$n]} {
-            puts -nonewline "$var='[set pv$n]' "
-        } else {
-            puts -nonewline "$var: "
-        }
+set postbatch 500
+
+set cmd_opts [::cmdline::getoptions argv {
+    {port.arg 8080 "port for http"}
+    {sport.arg 0 "port for https"}
+}]
+
+# Each coroutine needs a separate Redis connection, keep a pool of them
+set freeRedis {}
+proc reqHandler req {
+    coroutine::util global redis
+    if {[llength $::freeRedis]} {
+        set redis [lpop ::freeRedis]
+    } else {
+        set redis [retcl new] ;# TODO options
+        $redis -async
     }
-    puts {}
+    try {
+        main $req
+    } finally {
+        lappend ::freeRedis $redis
+    }
+}
+proc redis args {
+    coroutine::util global redis
+    tailcall $redis {*}$args
 }
 
 # return html page heading
 proc heading params {
     dict with params {}
+    coroutine::util global page_title
     html "<!doctype html>
-    <head><style type='text/css'>
+    <head><title>[enpre1 $page_title]</title>
+    <style type='text/css'>
     body {color:$gen_fg; background-color: $gen_bg; font-family: Verdana}
     .but {width: 8em;}
     .bbut {width: 10em;}
@@ -60,27 +89,47 @@ proc heading params {
 <br/>}
     return $html
 }
+proc page_title title {
+    coroutine::util global page_title
+    set page_title $title
+}
 
 # Main page - check login status, then dispatch as required.
-proc main {sock suffix} {
+proc main {sock} {
+    set suffix [string trimleft [$sock getPath] /]
+    page_title Newsgrouper
 
+    set country [$sock getHeader cf-ipcountry] ;# Cloudflare-specific!
+    $sock setLogField remote $country
     #tailcall show_down $sock
     if {[serve_static_file $sock $suffix]} return
     if {[redirect_old_domain $sock $suffix]} return
-    if {[uk_user $sock]} {
+
+    set urec [get_user_record $sock]
+    lassign $urec user can_post params
+
+    if {[string match -nocase news:* $suffix]} {
+        set suffix [string range $suffix 5 end]
+    }
+    if {[regexp {^(<[[:graph:]]+>)([mwrv]{0,4})$} $suffix - msgid flags]} {
+        tailcall do_msgid_art $urec $sock $msgid $flags
+    }
+    switch -- $suffix {
+        tops {tailcall do_tops $urec $sock}
+        do_login {tailcall do_login $sock}
+        do_guest {tailcall do_guest $sock}
+    }
+    if {$country eq "GB"} {
         tailcall osa_block $sock
     }
-
     # If user is not logged in, show the login page
-    set urec [get_user_record $sock]
-    if {$urec eq {}} {
+    if {$user == 0} {
         if {[hack_attack $sock $suffix]} return
         tailcall show_login $sock $suffix
     }
-    lassign $urec user can_post params
 
     if {[dict getdef $params banned 0]} {
-        Httpd_Error $sock 403 BANNED
+        $sock errorResponse 403 BANNED
         return
     }
     #if {[need_warn $sock $urec]} {
@@ -98,12 +147,16 @@ proc main {sock suffix} {
         html [show_group_search]
         html [show_msgid_search]
         html [other_info] }
-    {^tops$} {
-        html [top_groups_read]
-        html [top_groups_posted]
-        html [big8_active_list] }
+    {^([[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+)(/.*)?$} {
+        lassign $matches - group rest
+        tailcall dispatch_group $urec $sock $group $rest }
+    {^face/([[:graph:]]+)\.png$} {
+        lassign $matches - addr
+        tailcall get_face $sock $addr }
     {^post$} {
         html [do_post $urec $sock] }
+    {^do_block$} {
+        tailcall do_block $sock }
     {^block$} {
         tailcall save_block $urec $sock }
     {^login$} {
@@ -114,40 +167,51 @@ proc main {sock suffix} {
         html [edit_prefs $urec $sock] }
     {^save_prefs$} {
         html [save_prefs $urec $sock] }
-    {^([[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+)(/.*)?$} {
-        lassign $matches - group rest
-        tailcall dispatch_group $urec $sock $group $rest }
+    {^pref_(x?)face(\d*)$} {
+        lassign $matches - fx id
+        html [pref_face $urec $sock $fx $id] }
+    {^tmp_face/(\d+)\.png$} {
+        lassign $matches - id
+        tailcall tmp_face $sock $id }
+    {^load_face$} {
+        tailcall load_face $sock}
+    {^save_face$} {
+        tailcall save_face $urec $sock }
+    {^face_data$} {
+        tailcall face_data $urec $sock }
     {^markup$} {
-        html [toggle_pref $urec $sock mup] }
+        tailcall toggle_pref $urec $sock mup }
     {^reflow$} {
-        html [toggle_pref $urec $sock flo] }
+        tailcall toggle_pref $urec $sock flo }
     {^rot13$} {
-        html [toggle_pref $urec $sock r13] }
+        tailcall toggle_rot13 $urec $sock }
     {^allthr$} {
-        html [toggle_pref $urec $sock apt] }
+        tailcall toggle_pref $urec $sock apt }
     {^reset_colours$} {
-        html [reset_colours $urec $sock] }
-    {^face/([[:graph:]]+)\.png$} {
-        lassign $matches - addr
-        tailcall get_face $sock $addr }
+        tailcall reset_colours $urec $sock }
     {^msgid$} {
         html [do_msgid_search $urec $sock] }
     {^search$} {
         html [do_group_search $urec $sock] }
-    {^%3C[[:graph:]]+@[[:graph:]]+%3E$} {
-        html [do_msgid_art $urec $sock $suffix] }
+    {^change_pass$} {
+        tailcall change_pass $urec $sock }
+    {^testy$} {
+        html [do_testy $urec $sock] }
     default {
-        html "<br/>'$suffix' - THAT DOES NOT COMPUTE."
+        html "<br/>'[enpre1 $suffix]' - THAT DOES NOT COMPUTE."
     } }
 
     set footing {</body>}
-    Httpd_ReturnData $sock {text/html; charset=utf-8} \
-        [encoding convertto [heading $params]$html$footing]
+    $sock htmlResponse [heading $params]$html$footing
 }
 
 # Request specifies a group, process the rest of it.
 proc dispatch_group {urec sock group rest} {
     lassign $urec user can_post params
+
+    if {[dict exists $params captcha]} {
+        tailcall check_captcha $sock $urec $group$rest
+    }
 
     switch -regexp -matchvar num_etc $rest {
     {^$} {
@@ -160,11 +224,12 @@ proc dispatch_group {urec sock group rest} {
         html [show_thread $urec $group $start $num 0] }
     {^/(\d+)/raw$} {
         lassign $num_etc - num
+        if {! $can_post} {bot_check $urec $num}
         tailcall show_article_raw $sock $group $num }
     {^/(\d+)/post$} {
         lassign $num_etc - num
         html [compose_reply $urec $group $num] }
-    {^/upto/(\d+)$} {
+    {^/older/(\d+)$} {
         lassign $num_etc - num
         html [show_group $sock $urec $group $num] }
     {^/post$} {
@@ -177,19 +242,21 @@ proc dispatch_group {urec sock group rest} {
     {^/search/(\d+)/(\d+)$} {
         lassign $num_etc - start num
         html [show_thread $urec $group $start $num 1] }
+    {^/<([[:graph:]]+)>$} {
+        lassign $num_etc - msgid
+        tailcall group_msgid $sock $group $msgid }
     {^/rev$} {
-        html [reverse_group $sock $urec $group] }
+        tailcall reverse_group $sock $urec $group }
     {^/hide$} {
         tailcall hide_group $sock $urec $group }
     {^/charter$} {
         html [show_charter $group] }
     default {
-        html "<br/>'$group$rest' - THAT DOES NOT COMPUTE."
+        html "<br/>'[enpre1 $group$rest]' - COMPUTER SAYS NO."
     } }
 
     set footing {</body>}
-    Httpd_ReturnData $sock {text/html; charset=utf-8} \
-        [encoding convertto [heading $params]$html$footing]
+    $sock htmlResponse [heading $params]$html$footing
 }
 
 # If the request is just for a static file, handle it here and return 1.
@@ -197,7 +264,7 @@ proc dispatch_group {urec sock group rest} {
 proc serve_static_file {sock suffix} {
     switch -glob -- $suffix {
 	apple-touch-icon*.png {
-            Httpd_ReturnFile $sock image/png htdocs/newsgrouper-icon.png
+            $sock fileResponse htdocs/newsgrouper-icon.png image/png
             return 1
         }
         *.asc -
@@ -207,8 +274,8 @@ proc serve_static_file {sock suffix} {
         *.png -
         *.gif {
             if {! [file readable htdocs/$suffix]} {return 0}
-            Httpd_AddHeaders $sock Cache-Control max-age=$::week_secs
-            Httpd_ReturnFile $sock [Mtype $suffix] htdocs/$suffix
+            $sock cacheMaxAge $::week_secs
+            $sock fileResponse htdocs/$suffix
             return 1
         }
     }
@@ -217,45 +284,62 @@ proc serve_static_file {sock suffix} {
 
 proc hack_attack {sock suffix} {
     switch -glob -- $suffix {
+        {} {return 0}
         *.php -
         *.cgi -
         *.aspx {set mimetype text/html}
+	sitemap*xml -
 	.well-known/* {
-            after 2000
-            Httpd_Error $sock 404 "Return to sender, address unknown, no such number, no such zone."
+            coroutine::util after 1000
+            $sock errorResponse 404 "Return to sender, address unknown, no such number, no such zone."
             return 1
         }
         *.zip -
+        *.json -
         .* -
         */.* -
         wp-* -
         */wp-* {set mimetype text/plain}
-	default {return 0}
+	{%*/search/list} -
+	{*+*/search/list} {
+            coroutine::util after 5000
+            $sock dataResponse {AWANBILEYERHEIDYEBAMPOT
+Some Automated Insanity thinks this site is a search engine.  It is not.  The sooner the AI bubble pops, the better!} text/plain
+            return 1
+        }
+	default {
+            # if the request looks only potentially dodgy, delay reply for 3 seconds
+            if {[regexp {\d{9,}} $suffix]
+                || ! [regexp {^[[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+} $suffix]} {
+	      coroutine::util after 3000}
+            return 0
+        }
     }
 
     # Request is probing for vulnerabilities, serve them something appropriate.
-    after 2000
+    coroutine::util after 2000
     if {rand() < 0.2} {
-        Httpd_Error $sock 404 "This is not the page you are looking for."
+        $sock errorResponse 404 "This is not the page you are looking for."
         return 1
     }
     if {rand() < 0.2} {
-        Httpd_Redirect http://localhost/ $sock
+        $sock redirect http://localhost/
         return 1
     }
-    Httpd_AddHeaders $sock Content-Encoding gzip
+    coroutine::util after [expr {int(rand()*50000)}]
+    $sock setHeader content-encoding gzip
     if {rand() < 0.2} {
         # Files hex[0-4] are gzipped containing various repetitions of
         # "Don't mention it. ++???++ Out of Cheese Error. Redo From Start."
         set file hex[expr {[string length $suffix] % 5}]
-        Httpd_ReturnFile $sock $mimetype htdocs/$file
+        $sock fileResponse htdocs/$file $mimetype
     } elseif {rand() < 0.2} {
         # generate and return a random amount (<=100kB) of random crap
         exec head -[expr {int(rand()*100000)}]c /dev/urandom > htdocs/random
-        Httpd_ReturnFile $sock $mimetype htdocs/random
+        $sock fileResponse htdocs/random $mimetype
     } else {
-        # return nothing, but log the request
-        Log $sock Close
+        # return an error
+        $sock errorResponse 403 "On yer bike Jimmy!"
     }
     return 1
 }
@@ -263,7 +347,8 @@ proc hack_attack {sock suffix} {
 # Show the login page for guest or registered user.
 proc show_login {sock suffix} {
     html {
-<head><meta name='description' content='Read and post to Usenet Newsgroups with a simple web interface.'></head>
+<head><title>Newsgrouper: A web interface to Usenet discussion groups</title>
+<meta name='description' content='Read and post to Usenet Newsgroups with a simple web interface.'></head>
 <body style='color: black; background-color: lightblue; font-family: Verdana'>
 <span style='font-size: xx-large; color: purple'>Newsgrouper
 <span style='color:green; margin-left: 20px'> &#x1F5E8;</span> &#x1F4AC; <span style='color:red'>&#x1F5EF;</span> &#x1F4AD;
@@ -273,7 +358,7 @@ proc show_login {sock suffix} {
 A web interface to Usenet discussion groups (no binaries)
 </span>
 <br/><br/>
-<form action='/do/login' method='post'>
+<form action='/do_login' method='post'>
 <span style='font-size: large; width: 20%; float: left'>Email:<br/>Password:</span>
 <input type='text' name='email' size='40' maxlength='100'/>
 <br/>
@@ -287,7 +372,7 @@ A web interface to Usenet discussion groups (no binaries)
 <br/>
 <br/>
 <span style='font-size: large; width: 20%; float: left'>Alternatively</span>
-<input type=submit value="Continue as Guest" formaction='/do/guest' />
+<input type=submit value="Continue as Guest" formaction='/do_guest' />
 - this allows reading but not posting.
 <br/>
 <br/>
@@ -303,19 +388,23 @@ This cookie is not used for any other purpose, and no other cookies are used.
     }
     html "<input type='hidden' name='suffix' value='$suffix' />\n"
     html {</form></body>}
-    Httpd_ReturnData $sock text/html $html
+    $sock htmlResponse $html
 }
 
-package require sqlite3
-sqlite3 userdb $::user_db -fullmutex 1
+sqlite3 userdb $::user_db ;# -fullmutex 1
 #userdb timeout 1000
 
 package forget md5
-
-Direct_Url /do
+package require md5
+package require md5crypt
 
 # Do login process for a registered user
-proc /do/login {email pass suffix} {
+proc do_login sock {
+    set missing [GetQuery $sock email pass suffix]
+    if {[llength $missing]} {
+        $sock htmlResponse "<h3>Missing fields: $missing.</h3>"
+        return
+    }
 
     set fail_html {
 <body style='background-color: pink'>
@@ -323,109 +412,135 @@ proc /do/login {email pass suffix} {
 Sorry, your email/password combination was not recognised.
 <br/><br/> }
     append fail_html "<a href='/$suffix'>Try again.</a><br/><br/>"
-    append fail_html {Alternatively <a href='/do/guest'>Continue as Guest</a>
+    append fail_html {Alternatively <a href='/do_guest'>Continue as Guest</a>
 - this allows reading but not posting.
 </body>}
 
-    if {$email eq "" || $pass eq ""} {return $fail_html}
-
+    if {$email eq "" || $pass eq ""} {
+        $sock htmlResponse $fail_html; return
+    }
     # Check the credentials are valid
-    package require md5
-    package require md5crypt
     set enc_email [md5crypt::md5crypt $email $::user_salt]
     set enc_pass [md5crypt::md5crypt $pass $::user_salt]
 
     set user [userdb eval {SELECT num FROM users WHERE email == $enc_email AND pass == $enc_pass}]
-    if {$user eq {}} { return $fail_html }
-
-    # BUGGY - DISABLED FOR NOW:
-    #set user [upgrade_if_guest $user $enc_email $enc_pass]
+    if {$user eq {}} {
+        $sock htmlResponse $fail_html; return
+    }
 
     # Generate random cookie for user, write to their db record
     set salt [string range [clock clicks] end-7 end]
     set cookie [md5crypt::md5crypt [expr {rand()}] $salt]
     userdb eval {UPDATE users SET cookie = $cookie WHERE num = $user}
-    tailcall finish_login $cookie 1 $suffix
+    $sock setHeader set-cookie "userhash=$cookie; Max-Age=$::year_secs"
+
+    html "<body style='background-color: lightgreen'> [login_message 1]"
+
+    if {$suffix eq "login" || $suffix eq "logout"} {set suffix ""}
+    html "<form action='/$suffix' method='post'>
+<input type=submit value='Continue' style='width: 20%' />
+</form></body>"
+    $sock htmlResponse $html
 }
 
-# Check if already logged in as guest, if so upgrade user's guest db record.
-proc upgrade_if_guest {user enc_email enc_pass} {
-    lassign [Cookie_Get userhash] userhash
-    #puts "upgrade_if_guest: user=$user userhash='$userhash'"
-    if {$userhash in {{} -}} {return $user}
 
-    # Find the user's previous db record
-    lassign [userdb eval {SELECT num,email FROM users WHERE cookie == $userhash}] old_user old_email
-    if {$old_email ne {}} {return $user}
+# Return text for login confirmation page (guest or user)
+proc login_message registered {
+    tmpl html {<h1>Newsgrouper Login</h1>
 
-    # Guest: move their credentials to their old db record to preserve their history
-    #puts "Upgrading $old_user from $user"
-    userdb transaction {
-        userdb eval {DELETE FROM users WHERE num == $user}
-        userdb eval {UPDATE users SET email = $enc_email, pass = $enc_pass WHERE num = $old_user}
-    }
-    return $old_user
+%    set usertype [expr {$registered ? "Registered User" : "Guest"}]
+    Logging in as a $usertype ...
+
+<br/><br/>
+<em>This sets the only cookie this site uses.<br/>
+It can be removed by clicking <strong>Log Out</strong>.</em>
+<br/><br/>
+
+%    if {! $registered} {
+            Note that as a guest, logging out will forget your history and preferences,
+            so when you return it will not be possible to show what postings are new
+            since your previous visit.
+%    }
+    As a registered user you can log out without losing your history and preferences.
+    <br/><br/>}
 }
 
 # Do login process for a guest
-proc /do/guest {suffix} {
+proc do_guest sock {
+    set suffix {}
+    GetQuery $sock suffix
     package require md5
     package require md5crypt
     # Generate cookie for user, write a temporary db record for them
     set salt [string range [clock clicks] end-7 end]
     set cookie [md5crypt::md5crypt [expr {rand()}] $salt]
     userdb eval {INSERT INTO users(cookie) VALUES($cookie)}
-    tailcall finish_login $cookie 0 $suffix
-}
+    $sock setHeader set-cookie "userhash=$cookie; Max-Age=$::year_secs"
 
-# Do login confirmation page and complete the login process (guest or user)
-proc finish_login {cookie registered suffix} {
-    Cookie_Set -name userhash -value $cookie -path / -expires {next year} ;# TODO path needed?
-
-    html {<body style='background-color: lightgreen'>
-<h1>Newsgrouper Login</h1>
-}
-    set usertype [expr {$registered ? "Registered User" : "Guest"}]
-    html "Logging in as a $usertype ..."
-    html {
-<br/><br/>
-<em>This sets the only cookie this site uses.<br/>
-It can be removed by clicking <strong>Log Out</strong>.</em>
-<br/><br/>
-}
-    if {! $registered} {
-        html {Note that as a guest, logging out will forget your history and preferences, \
-            so when you return it will not be possible to show what postings are new \
-            since your previous visit. }
-    }
-    html {As a registered user you can log out without losing your history and preferences.<br/><br/>}
-    if {$suffix eq "login" || $suffix eq "logout"} {set suffix ""}
-    html "<form action='/$suffix' method='post'>"
-    html {
-<input type=submit value='Continue' style='width: 20%' />
-</form></body>}
-    return $html
+    html {<body style='background-color: khaki'>
+} [login_message 0] "<form action='/$suffix' method='post'>
+<input type=submit value='Continue' />
+</form></body>"
+    $sock htmlResponse $html
 }
 
 # Check if the user is logged in.
 # If so, return their user number, whether they can post, and their
-# preference settings.  If not, return empty string.
+# preference settings.  If not, return user number 0.
 proc get_user_record sock {
+    set nouser [list 0 0 [dict merge $::param_defaults $::colour_defaults] {}]
     # Get the user's cookie
-    lassign [Cookie_GetSock $sock userhash] userhash
-    #puts "get_user_record: sock='$sock' userhash='$userhash'"
-    if {$userhash in {{} -}} {return {}}
+    lassign [$sock getCookie userhash] userhash
+    if {$userhash in {{} -}} {return $nouser}
 
     # Find the user's db record
     userdb eval {SELECT num,email,params FROM users WHERE cookie == $userhash} {
-        upvar #0 Httpd$sock data
-        set data(mime,username) $num ;# for access log
+        $sock setLogField user $num
         set can_post [expr {$email ne {}}]
-        if {$can_post} {set data(mime,auth-user) *} ;# for access log
+        if {$can_post} {$sock setLogField ident *}
         set params [dict merge $::param_defaults $::colour_defaults $params]
-        return [list $num $can_post $params]
+        set ugrps [redis hgetall "ugrp $num"]
+        return [list $num $can_post $params $ugrps]
     }
-    return {}
+    return $nouser
+}
+
+# Guest users pulling old posts may be AI trawlers.
+# Give them a captcha 20% of the time, this will appear on their next request.
+set bot_check_dat [clock scan {1/1/2023}]
+proc bot_check {urec dat} {
+    if {$dat > $::bot_check_dat} return
+    set rand [::tcl::mathfunc::rand]
+    if {$rand > 0.2} return
+    lassign $urec user can_post params
+    dict set params captcha $rand
+    userdb eval {UPDATE users SET params = $params WHERE num = $user}
+}
+
+proc check_captcha {sock urec suffix} {
+    lassign $urec user can_post params
+    set cap_expected [dict get $params captcha]
+    set query [$sock getFormdata]
+    set cap_supplied [dict getdef $query captcha {}]
+printvars user cap_expected cap_supplied
+
+    if {$cap_supplied == $cap_expected} {
+        dict unset params captcha
+        userdb eval {UPDATE users SET params = $params WHERE num = $user}
+        $sock redirect /$suffix
+        return
+    }
+    coroutine::util after 2000
+    # Bot defense - generate a 'captcha' question and answer
+    lassign [captcha] cap_question cap_answer
+    dict set params captcha $cap_answer
+    userdb eval {UPDATE users SET params = $params WHERE num = $user}
+
+    html "<h1>Please answer the following question</h1>
+<form action='/$suffix' method='post'> $cap_question
+<input type=submit value='Continue' /> </form>"
+    $sock htmlResponse $html
+    $sock setLogField ident ?
 }
 
 # Do logout confirmation page and complete the logout process (guest or user)
@@ -440,7 +555,7 @@ proc do_logout {urec sock} {
     # TODO - for guest remove ugrp
 
     # Clear the cookie
-    Httpd_SetCookie $sock [Cookie_Make -name userhash -value - -path / -expires now]
+    $sock setHeader set-cookie "userhash=0; Max-Age=0"
 
     html {<h1>Newsgrouper Logout</h1>
 Logging Out...
@@ -450,19 +565,19 @@ Logging Out...
 <form action='/' method='post'>
 <input type=submit value='Continue' style='width: 20%' />
 </form>}
-    Httpd_ReturnData $sock text/html $html
+    $sock htmlResponse $html
 }
 
 # Show the home page first section with general information
 proc general_info urec {
     lassign $urec user can_post
-    html {
+    tmpl html {
 A web interface to Usenet discussion groups (no binaries)
 <span style='float: right'>
 <form action='/none' method='post'>
-}
-    html "<input type=submit value='[expr {$can_post ? "Terms" : "Register"}]' formaction='/terms.htm'  class='but'/>\n"
-    html "</form></span><br/>\n"
+
+    <input type=submit value='[expr {$can_post ? "Terms" : "Register"}]' formaction='/terms.htm'  class='but'/>
+    </form></span><br/>}
 }
 
 # Show the list of groups this user has previously read
@@ -471,7 +586,7 @@ proc show_groups_read {urec sock} {
 
     set prev_group {}
     set group_re {^https?://[^/]+/([[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+)}
-    regexp $group_re [GetRefer $sock] - prev_group
+    regexp $group_re [$sock getHeader referer] - prev_group
 
     html {
 <script type='text/javascript'>
@@ -480,19 +595,35 @@ function setup() {
 }
 </script>
 }
-    set groups_read [groups_read $user]
+    # [get nh counts] gets the list of groups the user has previously read.
+    # For each group returns name, number of new posts since last 
+    # read by this user & whether any of those is a reply to a post
+    # by this user.
+    set groups_read [get nh counts $user]
     if {[llength $groups_read] == 0} {return ""}
 
     html {
+<span style='clear: right; float: right'><br/>
+<form action='/all.all/search/list' method='post' style='display: inline'>
+<input type=submit value='Search within these groups } "\U01F50D" {' >
+</form></span>
 <h3>Groups previously read</h3>
 <table><thead>
 <tr align='left'><th>Name</th><th>Description</th><th>New</th><th></th></tr>
 </thead><tbody>
     }
 
-    foreach {group desc new} $groups_read {
+    foreach {group new new_reply} $groups_read {
+        lassign [groupstat $group] desc status
+        if {$status eq {}} continue
+	set new [expr {max(0, $new - [count_xnew $user $group])}]
+
         if {$new} {
-            html "<tr class='new'>"
+            if {$new_reply} {
+                html "<tr class='rep'>"
+            } else {
+                html "<tr class='new'>"
+            }
         } else {
             html "<tr>"
         }
@@ -506,7 +637,7 @@ function setup() {
             set id " id='sel'"
             set prev_group .
         }
-        html "<td><a$id href=/$group>$group</a></td><td>[enpre $desc]</td><td>$new</td>"
+        html "<td><a$id href=/$group>$group</a></td><td>[enpre1 $desc]</td><td>$new</td>"
         html "<td><a href=/$group/hide class='hide' tabindex='-1'>\U274C</a></td></tr>\n"
     }
 
@@ -563,7 +694,7 @@ proc do_group_search {urec sock} {
     foreach {group desc} $groups {
         set act [redis zscore newposts $group]
         html "<tr><td><a href=/$group>$group</a></td>" \
-            "<td>[enpre $desc]</td><td align='right'>$act</td></tr>\n"
+            "<td>[enpre1 $desc]</td><td align='right'>$act</td></tr>\n"
     }
 
     html "</tbody>\n</table>\n<br/><br/>"
@@ -574,7 +705,7 @@ proc do_group_search {urec sock} {
     return $html
 }
 
-# Show the form to search for for a message by its id
+# Show the form to search for a message by its id
 proc show_msgid_search {} {
     html {
 <h3>Find an article by message-id</h3>
@@ -595,25 +726,66 @@ proc do_msgid_search {urec sock} {
     set missing [GetQuery $sock msgid]
     if {[llength $missing]} {return "<h3>Msgid missing.</h3>"}
     set msgid [string trim $msgid]
-    html "<h3>Article with message-id: [enpre $msgid]</h3>"
-    if {! [regexp {<[[:graph:]]+@[[:graph:]]+>} $msgid]} {
-        return "$html<h4>Invalid message-id.</h4>"
+    if {! [regexp {<[[:graph:]]+>} $msgid]} {
+        return "<h3>Invalid message-id: '[enpre1 $msgid]'.</h3>"
     }
-
-    if {[catch {get nh mid $msgid} art]} {
-        return "$html<h4>Article Not Found.</h4>"
-    }
-    lassign [parse_article $art] headers body
-    return [show_article $urec $headers $body]
+    html [show_art_byid $urec $msgid {}]
+    return $html
 }
 
-proc do_msgid_art {urec sock msgid} {
-    set msgid [Url_Decode $msgid]
+proc do_msgid_art {urec sock msgid flags} {
+    lassign $urec user can_post params
+    html [heading $params]
+    html [show_art_byid $urec $msgid $flags]
+    html {</body>}
+    $sock htmlResponse $html
+}
+
+proc show_art_byid {urec msgid flags} {
+    lassign $urec user can_post params
+    html "<h3>Article with message-id: [enpre1 $msgid]</h3>"
     if {[catch {get nh mid $msgid} art]} {
-        return "$html<h4>Article Not Found.</h4>"
+        html "<h4>Article Not Found.</h4>"
+	return $html
     }
-    lassign [parse_article $art] headers body
-    return [show_article $urec $headers $body]
+    foreach {flag param} {
+        m mup
+	w flo
+	r r13
+        v vs
+    } {
+        set on($flag) [expr {[string first $flag $flags] != -1}]
+        dict set params $param $on($flag)
+        if {$on($flag)} {
+            set flipflag($flag) [string map [list $flag {}] $flags]
+        } else {
+            set flipflag($flag) $flag$flags
+        }
+    }
+
+    if {$on(v)} {
+        html "<pre>\n[enpre1 $art]\n</pre>\n"
+    } else {
+        lassign [parse_article $art] headers body
+        html [show_article $user $params $headers $body]
+    }
+
+    html {<form action='/' method='post' >}
+    html "\n<input type=submit value='[tick $on(v)] View Source' formaction='/$msgid$flipflag(v)' />"
+    html "\n<input type=submit value='[tick $on(w)] Wrap' formaction='/$msgid$flipflag(w)' />"
+    html "\n<input type=submit value='[tick $on(m)] Markup' formaction='/$msgid$flipflag(m)' />"
+    html "\n<input type=submit value='[tick $on(r)] Rot13' formaction='/$msgid$flipflag(r)' />"
+    html {</form>}
+}
+
+proc do_tops {urec sock} {
+    lassign $urec user can_post params
+    html [heading $params]
+    html [top_groups_read]
+    html [top_groups_posted]
+    html [big8_active_list]
+    html {</body>}
+    $sock htmlResponse $html
 }
 
 proc other_info {} {
@@ -640,7 +812,7 @@ proc top_groups_read {} {
     }
 
     html {
-<h3>Top twenty groups most read here</h3>
+<h3>Top twenty groups most read on this site</h3>
 <table><thead>
 <tr align='left'><th>Name</th><th>Description</th><th>Reads</th></tr>
 </thead><tbody>
@@ -650,7 +822,7 @@ proc top_groups_read {} {
         set percent [expr {100 * $reads / $total_reads}]
 	lassign [groupstat $group] desc
 
-        html "<tr><td><a href=/$group>$group</a></td><td>[enpre $desc]</td><td align='right'>$percent%</td></tr>\n"
+        html "<tr><td><a href=/$group>$group</a></td><td>[enpre1 $desc]</td><td align='right'>$percent%</td></tr>\n"
     }
 
     html "</tbody>\n</table>\n"
@@ -665,18 +837,18 @@ proc top_groups_posted {} {
     if {[llength $group_posts] == 0} return
 
     html {
-<h3>Top twenty groups with most posts globally</h3>
+<h3>Top twenty groups with most posting activity globally</h3>
 <table><thead>
 <tr align='left'><th>Name</th><th>Description</th><th>Activity</th><th></th></tr>
 </thead><tbody>
     }
 
     foreach {group posts} $group_posts {
-        if {[catch {groupstat $group} desc_stat]} continue
-	lassign $desc_stat desc
+        lassign [groupstat $group] desc status
+        if {$status eq {}} continue
 
         html "<tr><td><a href=/$group>$group</a></td>" \
-            "<td>[enpre $desc]</td><td align='right'>$posts</td></tr>\n"
+            "<td>[enpre1 $desc]</td><td align='right'>$posts</td></tr>\n"
     }
 
     html "</tbody>\n</table>\n"
@@ -701,10 +873,10 @@ proc big8_active_list {} {
     }
 
     foreach group $group_list {
-        if {[catch {groupstat $group} desc_stat]} continue
-	lassign $desc_stat desc
+        lassign [groupstat $group] desc status
+        if {$status eq {}} continue
 
-        html "<tr><td><a href=/$group>$group</a></td><td>[enpre $desc]</td></tr>\n"
+        html "<tr><td><a href=/$group>$group</a></td><td>[enpre1 $desc]</td></tr>\n"
     }
 
     html "</tbody>\n</table>\n"
@@ -714,17 +886,20 @@ proc big8_active_list {} {
 # Hack to avoid ::mime::field_decode failure on Chinese posts using charset GBK,
 # see KBK's note at https://wiki.tcl-lang.org/page/Encoding+Translations+and+i18n
 set ::mime::reversemap(gbk) gb2312
+set ::mime::reversemap(cp1252) cp1252 ;# WTF! FIXME
 
 # Show the list of discussion threads for a group
-proc show_group {sock urec group {upto 0}} {
+proc show_group {sock urec group {older 0}} {
     lassign $urec user can_post
+    page_title $group
     set prev_thread 0
     set prev_thread_re "[string map {. \\. + \\+} $group]/(\\d+)"
-    regexp $prev_thread_re [GetRefer $sock] - prev_thread
+    regexp $prev_thread_re [$sock getHeader referer] - prev_thread
     if {$prev_thread} {
-        GetStash u$user.$group upto
+        GetStash u$user.$group older
     } else {
-        PutStash u$user.$group upto
+        PutStash u$user.$group older
+	clear_xnew $user $group
     }
 
     html {
@@ -743,7 +918,8 @@ function setup() {
 }
 </script>
 }
-    if {[catch {lassign [groupstat $group] desc status}]} {
+    lassign [groupstat $group] desc status
+    if {$status eq {}} {
         return "<h3>Group '$group' not found.</h3>"
     }
 
@@ -760,16 +936,14 @@ function setup() {
     html "formaction='/$group/charter' />\n"
     html "</form></span>\n"
 
-    html "<h3><a href='/$group'>$group</a> '[enpre $desc]'</h3>\n"
+    html "<h3><a href='/$group'>$group</a> '[enpre1 $desc]'</h3>\n"
     html "<base href='/$group/0' />\n"
 
-    set threadinfo [cacheThreadinfo $urec $group $upto]
+    set threadinfo [cacheThreadinfo $urec $group $older 0]
     dict with threadinfo {}
 
-    set first [lindex $hdrs 0]
     set last [lindex $hdrs end-1]
-
-    update_last $user $group $last
+    update_last $urec $group $last
 
     html {
 <table style='table-layout: fixed; width:100%;' >
@@ -782,7 +956,7 @@ function setup() {
 </colgroup>
 
 <thead>
-<tr align='left'><th>Thread Subject</th><th>Originator</th>
+<tr align='left'><th>Thread Subject</th><th>Original Poster</th>
 } "<th><a href=/$group/rev>Date</a></th>" {
 <th align='right' style='font-size: x-small'>Posts</th>
 <th align='right' style='font-size: x-small'>New</th>
@@ -824,10 +998,10 @@ function setup() {
         if {$start_num == $prev_thread} {
             set id " id='sel'"
         }
-        html "<td><a$id href=$start_num$tail>[enpre $sub]</a></td>"
-	html "<td>[enpre $name]"
-        if {[tsv::exists Faces $addr]} {
-            html " <img src='/face/[Url_Encode $addr].png' width='20' align='top' style='float: right'>\n"
+        html "<td><a$id href=$start_num$tail>[enpre1 $sub]</a></td>"
+	html "<td>[enpre1 $name]"
+        if {[dict exists $::Faces $addr]} {
+            html " <img src='/face/[::wibbly::enhex $addr].png' width='20' align='top' style='float: right'>\n"
         }
 	html "</td><td>$dat</td><td align='right'>$thread_posts</td><td align='right'>$new_posts</td></tr>\n"
     }
@@ -840,9 +1014,9 @@ function setup() {
     html "<form action='/' method='post' style='display: inline'>"
 
     set posts [expr {[llength $hdrs] / 2}]
-    if {$posts >= 300} {
+    if {$posts >= $::postbatch} {
         html {<input type=submit value='Older Posts' class='but' }
-        html "formaction='/$group/upto/[expr {$first - 1}]' />\n"
+        html "formaction='/$group/older/[expr {$older+$::postbatch}]' />\n"
     }
 
     html "</form>\n"
@@ -851,10 +1025,13 @@ function setup() {
 }
 
 # Update number of the last article when user previously read this group
-proc update_last {user group last} {
+proc update_last {urec group last} {
+    # The ugrp record for a user is a map from each group read to
+    # the last article present when this user last read the group.
     # Article numbers after the ugrp old_last value will be considered new.
     # If the ugrp record does not already have a new_last value, set it.
-    set ugrp [redis hget "ugrp $user" $group]
+    lassign $urec user can_post params ugrps
+    set ugrp [dict getdef $ugrps $group 0]
     lassign $ugrp old_last new_last
     if {$new_last eq {} && $last ne {}} {
         redis hset "ugrp $user" $group [list $old_last $last]
@@ -871,53 +1048,37 @@ proc reverse_group {sock urec group} {
 
     userdb eval {UPDATE users SET params = $params WHERE num = $user}
     clearThreadinfo $user
-    Httpd_Redirect /$group $sock
+    $sock redirect /$group
+}
+
+proc group_msgid {sock group msgid} {
+    lassign [groupstat $group] desc status grpid
+    set dat [overdb eval {SELECT dat FROM over WHERE grpid==$grpid and msgid==$msgid}]
+    if {$dat ne {}} {
+        $sock redirect /$group/$dat
+    } else {
+        $sock errorResponse 404 "Sorry, can't find that right now :-("
+    }
 }
 
 # Show one discussion thread
 proc show_thread {urec group start target insearch} {
-    if {[catch {get nh art $group $start} art]} {
-	set sub {}
-    } else {
-        lassign [parse_article $art] headers body
-        set sub [dict getdef $headers Subject {}]
-        catch {set sub [::mime::field_decode $sub]}
-    }
 
-    html "<a id='up' href='/$group' style='font-size: x-large'>$group</a>:"
-    html "<span style='font-size: x-large'> [enpre $sub]</span>\n"
-
-    html {<iframe style='position:fixed; left:0%; bottom:0%; height:80%; width:30%' }
-    set thread_list [show_thread_list $urec $group $start $target $insearch]
-    if {$thread_list eq {}} {set thread_list {"<br/>Thread not found.<br/>" 0 0 0 0}}
-    set linx [lassign $thread_list list_html thread target]
-    html "name='list' srcdoc=\"$list_html\"></iframe>\n"
-
-    html {<iframe style='position:fixed; right:0%; bottom:0%; height:80%; width:69%' }
-    lassign $urec user can_post params
-    if {[dict get $params apt]} {
-        set art_html [show_thread_arts $urec $group $thread $target $start]
-    } else {
-        set art_html [get_article $urec $group $target $start $linx]
-    }
-    html "name='art' srcdoc=\"[enpre2 $art_html]\"></iframe>\n"
-
-    return $html
-}
-
-# Show the thread structure and posters for one discussion thread
-proc show_thread_list {urec group start target insearch} {
-    lassign $urec user can_post params
+    # Show the thread structure and posters for this discussion thread
+    lassign $urec user can_post params ugrps
+    if {! $can_post} {bot_check $urec $start}
+    set fail {<h3>Thread not found</h3>}
 
     # get the block of headers containing the thread start
-    foreach upto [list 0 [expr {$start+250}]] {
-        set threadinfo [cacheThreadinfo $urec $group $upto]
-        dict with threadinfo {}
-        if {[llength $hdrs] == 0} return
-        set first [lindex $hdrs 0]
-        if {$start >= $first+50} break
+    set older 0
+    GetStash u$user.$group older
+    set threadinfo [cacheThreadinfo $urec $group $older 0]
+    if {! [dict exists $threadinfo hdrs $start]} {
+        set threadinfo [cacheThreadinfo $urec $group 0 $start]
     }
-    if {$threads eq ""} return
+    dict with threadinfo {}
+    if {[dict size $hdrs] == 0} {return $fail}
+    if {$threads eq ""} {return $fail}
 
     # look for the thread identified by $start
     set found 0
@@ -946,7 +1107,6 @@ proc show_thread_list {urec group start target insearch} {
         set prev_thread 0
         # last-ditch attempt to find thread by working backwards
         foreach {num thr} $threads {
-            if {$num > $target} continue
             if {[lsearch -stride 2 -integer $thr $target] != -1} {
                 set found 1
                 set thread $thr
@@ -954,13 +1114,13 @@ proc show_thread_list {urec group start target insearch} {
             }
         }
     }
-    if {! $found} return
+    if {! $found} {return $fail}
 
     # find target and previous articles
     set prev 0
     set pv 0
     foreach {num indent} $thread {
-        set new [expr {$num > $old_last}]
+        set new [expr {$num > $old_last && [check_xnew $urec $num $hdrs]}]
         if {$new && $target == 0} {set target $num}
         lappend nns $new $num
 	if {$num == $target} {set pv $prev}
@@ -1011,6 +1171,7 @@ function setup() {
     html {
 <table style='table-layout: fixed; width:100%; border-collapse:collapse' >
 }
+    set thread_sub {}
     set indent 0
     set prev_ind $indent
     foreach {num indent} $thread {
@@ -1025,7 +1186,7 @@ function setup() {
         if {$num == $target} {
             append clas { sel}
         }
-        if {$num > $old_last} {
+        if {$num > $old_last && [check_xnew $urec $num $hdrs]} {
             if {$num in $reply_nums} {
                 append clas { rep}
             } else {
@@ -1038,6 +1199,9 @@ function setup() {
         html "<tr><td$frag colspan='[expr {30-$indent}]' class='$clas' >"
 
         lassign [dict get $hdrs $num] prev sub frm tim id
+        if {$num == $target} {
+            set thread_sub [encoding convertfrom $sub]
+	}
         set frm [encoding convertfrom $frm]
         set parsed [lindex [::mime::parseaddress $frm] 0]
         set name [dict getdef $parsed friendly $frm]
@@ -1045,8 +1209,8 @@ function setup() {
         set dat [clock format $tim -format {%d %b %y}]
         html "<span style='float: right'>$dat</span>"
         html "<a href='$num'>$name</a>"
-        if {[tsv::exists Faces $addr]} {
-            html "<img src='/face/[Url_Encode $addr].png' width='20' hspace='5' align='top' style='float: right'>\n"
+        if {[dict exists $::Faces $addr]} {
+            html "<img src='/face/[::wibbly::enhex $addr].png' width='20' hspace='5' align='top' style='float: right'>\n"
         }
 
         html {</td>
@@ -1100,12 +1264,57 @@ function setup() {
         }
     }
     html {</form></body>}
-    return [list $html $thread $target $nx $pv $nn]
+    set list_html $html
+
+    page_title "$thread_sub - $group"
+    set html "<a id='up' href='/$group' style='font-size: x-large'>$group</a>:"
+    html "<span style='font-size: x-large'> [enpre1 $thread_sub]</span>\n"
+
+    html {<iframe style='position:fixed; left:0%; bottom:0%; height:80%; width:30%' }
+    html "name='list' srcdoc=\"[enpre2 $list_html]\"></iframe>\n"
+
+    set thread_details [list $thread $target $nx $pv $nn]
+    html {<iframe style='position:fixed; right:0%; bottom:0%; height:80%; width:69%' }
+    set art_html [thread_arts $urec $group $thread_details $start]
+    html "name='art' srcdoc=\"[enpre2 $art_html]\"></iframe>\n"
+
+    return $html
 }
 
-# Lifted from Wibble:
+# The following *_xnew procs track which posts should not be counted
+# as new because they are cross-posted to a group already read.
+proc check_xnew {urec num hdrs} {
+    lassign [dict get $hdrs $num] prev sub frm dat msgid xgrpids
+    tailcall check2_xnew $urec $num $msgid $xgrpids
+}
+
+proc check2_xnew {urec num msgid xgrpids} {
+    lassign $urec user can_post params ugrps
+    foreach xgrpid $xgrpids {
+        set xgroup [id2group $xgrpid]
+        if {! [dict exists $ugrps $xgroup]} continue
+        if {[dict get $ugrps $xgroup] >= $num} {return 0}
+        dict set ::XN $user $xgrpid $msgid [clock seconds]
+    }
+    return 1
+}
+
+proc count_xnew {user group} {
+    lassign [groupstat $group] desc status grpid
+    return [dict size [dict getdef $::XN $user $grpid {}]]
+}
+
+proc clear_xnew {user group} {
+    lassign [groupstat $group] desc status grpid
+    if {[dict exists $::XN $user]} {
+        dict unset ::XN $user $grpid
+    }
+}
+set XN [dict create]
+
+# Adapted from Wibble:
 # Encode for HTML <pre> by substituting angle brackets and ampersands.
-proc enpre {str} {
+proc enpre1 {str} {
     string map {< &lt; > &gt; & &amp; \" &quot; \r "" ' &#39;} $str
 }
 # Extra quoting step needed for srcdoc:
@@ -1113,27 +1322,13 @@ proc enpre2 {str} {
     string map {& &amp; \" &quot;} $str
 }
 
-proc show_thread_arts {urec group thread target start} {
-    foreach {num indent} $thread {
-        prefetch nh art $group $num
-    }
-    foreach {num indent} $thread {
-        set clas art
-        if {$num==$target} {append clas " target"}
-        html "<span class='$clas' id='a$num'>"
-        html [get_article $urec $group $num $start {}] <hr/>
-        html "</span>"
-    }
-    return $html
-}
-
-# Generate an article display - this will be put in an iframe
-proc get_article {urec group num thr linx} {
-    if {[catch {get nh art $group $num} art]} {
-        return "ARTICLE NOT FOUND: [enpre $art]"
-    }
+# Generate the display of one or more articles - to be put in an iframe
+proc thread_arts {urec group thread_details start} {
     lassign $urec user can_post params
     dict with params {}
+
+    set linx [lassign $thread_details thread target]
+    if {$thread == 0} return
 
     html "<head><style type='text/css'>
     body {color: $gen_fg; background-color: $gen_bg}
@@ -1144,6 +1339,8 @@ proc get_article {urec group num thr linx} {
 <script type='text/javascript'>
 function keyDown(event) {
 	//console.log('keyDown', event);
+	if (event.altKey || event.ctrlKey || event.metaKey) {return;}
+
 	const me = new MouseEvent('click');
         const keyMap = { '+': 'nx',
                          '-': 'pv',
@@ -1187,6 +1384,21 @@ function scrolling(event) {
 		newArt.scrollIntoView({block: 'center'});
 	}
 }
+async function doShare(event) {
+	//console.log('doShare', event);
+	let data = event.target.dataset;
+	let shareData = {
+		title: data.title,
+		text: data.subject,
+		url: data.link
+	};
+	try {
+		await navigator.share(shareData);
+		//console.log('shared successfully');
+	} catch (err) {
+		console.log('Sharing Error:', err);
+	}
+}
 function setup() {
 	//console.log('IN ART SETUP');
 	window.focus();
@@ -1196,27 +1408,68 @@ function setup() {
 	if (target) { target.scrollIntoView(); }
 
 	window.addEventListener('scroll', scrolling);
+
+        let shareButton = document.getElementById('sh');
+	if (navigator.canShare) {
+        	shareButton.disabled=false;
+        	shareButton.addEventListener('click', doShare);
+	}
 }
 </script>
     }
 
-    redis zincrby groupreads 10 $group
+    if {$apt} {
+        html [show_thread_arts $urec $group $thread $target $start]
+        redis zincrby groupreads 20 $group
+    } else {
+        html [get_article $urec $group $target $start $linx $target]
+        redis zincrby groupreads 10 $group
+    }
 
-    lassign [parse_article $art] headers body
-    html [show_article $urec $headers $body]
-    html [show_art_foot $urec $group $num $thr $linx $headers]
     html "\n</body>"
     return $html
 }
 
-# Format an article for display
-proc show_article {urec headers body} {
-    if {$headers eq {}} {
-        html {FAILED TO PARSE ARTICLE:<br/><hr/>}
-        html "<pre>\n[enpre $body]\n</pre>\n"
-        return $html
+proc show_thread_arts {urec group thread target start} {
+    foreach {num indent} $thread {
+        prefetch nh art $group $num
+        set lastnum $num
+    }
+    foreach {num indent} $thread {
+        set clas art
+        if {$num==$target} {append clas " target"}
+        html "\n<div class='$clas' id='a$num' "
+        if {$num==$lastnum} {html "style='min-height:100vh'"}
+        html ">"
+        html [get_article $urec $group $num $start {} $target] <hr/>
+        html "</div>"
+    }
+    return $html
+}
+
+# Generate an article display
+proc get_article {urec group num thr linx target} {
+    if {[catch {get nh art $group $num} art]} {
+        return "ARTICLE NOT FOUND: [enpre1 $art]"
     }
     lassign $urec user can_post params
+    set rot13 0
+    GetStash r$user.$group.$num rot13
+    dict set params r13 $rot13
+
+    lassign [parse_article $art] headers body
+    html [show_article $user $params $headers $body $group]
+    html [show_art_foot $user $can_post $params $group $num $thr $linx $headers $target]
+    return $html
+}
+
+# Format an article for display
+proc show_article {user params headers body {group {}}} {
+    if {$headers eq {}} {
+        html {FAILED TO PARSE ARTICLE:<br/><hr/>}
+        html "<pre>\n[enpre1 $body]\n</pre>\n"
+        return $html
+    }
     set markup [dict get $params mup]
     set reflow [dict get $params flo]
     set rot13 [dict get $params r13]
@@ -1228,23 +1481,36 @@ proc show_article {urec headers body} {
         if {[dict exists $headers Face]} {
             # see spec at https://quimby.gnus.org/circus/face/
             set facedata [dict get $headers Face]
-            tsv::set Faces $addr [binary decode base64 $facedata]
-            html "<img src='/face/[Url_Encode $addr].png' alt='Face' style='float:right'>\n"
+            dict set ::Faces $addr [binary decode base64 $facedata]
+            html "<img src='/face/[::wibbly::enhex $addr].png' alt='Face' style='float:right'>\n"
         } elseif {[dict exists $headers X-Face]} {
             set facedata [dict get $headers X-Face]
-            tsv::set Faces $addr {}
+            dict set ::Faces $addr {}
 	    if {[redis hset faces $addr $facedata]} {
-                prefetch nu face $facedata
+                prefetch nh face $facedata
             }
-            html "<img src='/face/[Url_Encode $addr].png' alt='X-Face' style='float:right'>\n"
+            html "<img src='/face/[::wibbly::enhex $addr].png' alt='X-Face' style='float:right'>\n"
         }
     }
+    set msgid [dict get $headers Message-ID]
     foreach hdr {From Newsgroups Subject Date} {
         set field($hdr) [dict getdef $headers $hdr {}]
+        if {$hdr eq "Newsgroups"} {
+            set grplinx {}
+            foreach grp [split $field($hdr) ,] {
+                if {$grp eq $group} {
+                    lappend grplinx $grp
+                } else {
+                    lappend grplinx "<a href='/$grp/$msgid' target='_top'>$grp</a>"
+                }
+            }
+            html "<em>${hdr}: [join $grplinx ,]</em><br/>\n"
+            continue
+        }
         catch {set field($hdr) [::mime::field_decode $field($hdr)]}
-        html "<em>${hdr}: [enpre $field($hdr)]</em><br/>\n"
+        html "<em>${hdr}: [enpre1 $field($hdr)]</em><br/>\n"
     }
-    html "<br/>\n"
+    #html "<br/>\n"
     if {! $reflow} {html "<pre>\n"}
     set in_quote 0
     foreach line $body {
@@ -1258,16 +1524,8 @@ proc show_article {urec headers body} {
         if {$rot13} {
             set line [rot13 $line]
 	}
-        if {$markup} {
-            html "[markup_art_line $line]\n"
-        } else {
-	    # make URLs clickable, encode <>
-	    set url_re {https?://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+}
-	    set line [regsub -all $url_re $line "\x01&\x02"]
-	    set line [enpre $line]
-	    set line [regsub -all {\x01([[:graph:]]+)\x02} $line {<a href='\1' target='_blank'>\1</a>}]
-            html "$line\n"
-        }
+        html "[markup_art_line $markup $line]\n"
+
         if {$reflow} {
             html "<br/>"
         }
@@ -1278,21 +1536,31 @@ proc show_article {urec headers body} {
 
 # Convert one article line to html
 # (might I be overthinking this?)
-proc markup_art_line line {
+proc markup_art_line {markup line} {
     # First tokenise line into a list of triples:
     # text before the token, token type, text of the token.
-    # Token types are url, begin-emphasis, end-emphasis.
-    set url_re {(https?://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+)}
+    # Token types are url, news-msgid, begin-emphasis, end-emphasis.
+    set url_re {([[:alnum:]\-+]+://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+)}
+    set news_re {(<[[:graph:]]+@[[:alnum:]\-\.]+>)}
     set begin_emp_re {(?:(?:\A|\s)([*/_]+)[[:alnum:]])}
     set end_emp_re {(?:[[:alnum:]]([*/_]+)(?:\Z|\s))}
-    set re "$url_re|$begin_emp_re|$end_emp_re"
+    set re "$url_re|$news_re"
+    set matches {all url news}
+    set be -1; set ee -1
+    if {$markup} {
+        append re "|$begin_emp_re|$end_emp_re"
+        lappend matches be ee
+    }
     set indices [regexp -indices -all -inline -- $re $line]
     set start 0
     set ::tokens {}
-    foreach {all url be ee} $indices {
+    foreach $matches $indices {
         if {[lindex $url 0] > -1} {
             set tok u
 	    lassign $url t0 t1
+	} elseif {[lindex $news 0] > -1} {
+            set tok n
+	    lassign $news t0 t1
 	} elseif {[lindex $be 0] > -1} {
             set tok b
 	    lassign $be t0 t1
@@ -1300,6 +1568,13 @@ proc markup_art_line line {
             set tok e
 	    lassign $ee t0 t1
 	}
+	# hack for URLs enclosed in ()
+	if {$tok eq "u" && [string index $line $t0-1] eq "("} {
+            set close [string last ) $line $t1]
+            if {$close > $t0} {
+                set t1 [expr {$close - 1}]
+            }
+        }
         set pre_txt [string range $line $start $t0-1]
         set tok_txt [string range $line $t0 $t1]
         set start [expr {$t1 + 1}]
@@ -1317,10 +1592,11 @@ proc markup_art_tokens {{recursed 0}} {
     while {[llength $::tokens]} {
         set ::tokens [lassign $::tokens pre_txt tok tok_txt]
 
-        html [enpre $pre_txt]
+        html [enpre1 $pre_txt]
 
         switch $tok {
             u { html "<a href='$tok_txt' target='_blank'>$tok_txt</a>" }
+            n { html "<a href='/$tok_txt' target='_blank'>[enpre1 $tok_txt]</a>" }
             e { if {$recursed} {return [list $tok_txt $html]}
                 html $tok_txt }
             b { lassign [markup_art_em_tokens $tok_txt] extra_end nested_html
@@ -1366,8 +1642,7 @@ proc markup_art_em_tokens unclosed {
 }
 
 # generate the buttons to show under an article
-proc show_art_foot {urec group num thr linx headers} {
-    lassign $urec user can_post params
+proc show_art_foot {user can_post params group num thr linx headers target} {
     set from [dict getdef $headers From {}]
     set parsed [lindex [::mime::parseaddress $from] 0]
     set name [dict getdef $parsed friendly {}]
@@ -1377,12 +1652,8 @@ proc show_art_foot {urec group num thr linx headers} {
     set rot13 [dict get $params r13]
     set allthr [dict get $params apt]
     lassign [groupstat $group] desc status
-    if {[dict exists $headers Message-ID]} {
-        set msgid [dict get $headers Message-ID]
-    } else {
-        set msgid [dict getdef $headers Message-Id {}]
-    }
-
+    set msgid [dict getdef $headers Message-ID {}]
+    set sub [dict getdef $headers Subject {}]
 
     html {
     <form action='/' method='post' target='_top' style='display: inline'>}
@@ -1418,26 +1689,27 @@ proc show_art_foot {urec group num thr linx headers} {
     }
     html "\n<input type=submit value='\U01F6AB Block Poster' class='bbut' "
     if {$addr ne {}} {
-        html "formaction='/do/block' formtarget='_self' />"
+        html "formaction='/do_block' formtarget='_self' />"
     } else {
         html "disabled='disabled' />"
     }
-    html "<input type='hidden' name='name' value='[enpre $name]' />"
-    html "<input type='hidden' name='address' value='$addr' />"
-    html "<input type='hidden' name='group' value='$group' />"
-    html "<input type='hidden' name='num' value='$num' />"
-    html "<input type='hidden' name='thr' value='$thr' />"
+    tmpl html {<input type='hidden' name='name' value='[enpre1 $name]' />
+    <input type='hidden' name='address' value='$addr' />
+    <input type='hidden' name='group' value='$group' />
+    <input type='hidden' name='num' value='$num' />
+    <input type='hidden' name='thr' value='$thr' />
+    }
+    set idvs [expr {$num==$target ? "id='vs'" : ""}]
+    tmpl html {<input $idvs type=submit value='View Source \U01F1FB' formaction='/$group/$num/raw' formtarget='viewsource' class='bbut' />
 
-    html "\n<input id='vs' type=submit value='View Source \U01F1FB' formaction='/$group/$num/raw' formtarget='viewsource' class='bbut' />"
-
-    html "\n<input id='mu' type=submit value='[tick $markup] Markup \U01F1F2' formaction='/markup' class='bbut' />"
-    html "\n<input id='rf' type=submit value='[tick $reflow] Wrap \U01F1FC' formaction='/reflow' />"
-    html "\n<input id='ro' type=submit value='[tick $rot13] Rot13 \U01F1F7' formaction='/rot13' />"
-    html "\n<input id='ap' type=submit value='[tick $allthr] All posts \U01F1E6' formaction='/allthr' />"
-    html "\n<a href='/$msgid' target='_blank'>Permalink</a>"
-
-    html </form>
-    return $html
+    <input id='mu' type=submit value='[tick $markup] Markup \U01F1F2' formaction='/markup' class='bbut' />
+    <input id='rf' type=submit value='[tick $reflow] Wrap \U01F1FC' formaction='/reflow' />
+    <input id='ro' type=submit value='[tick $rot13] Rot13 \U01F1F7' formaction='/rot13' />
+    <input id='ap' type=submit value='[tick $allthr] All Posts \U01F1E6' formaction='/allthr' />
+    <button id='sh' type='button' disabled='disabled' data-link='https://$::this_site/$msgid' data-subject='$sub' data-title='$group Posting'>\U290A Share</button>
+    <a href='/$msgid' target='_blank'>Permalink</a>
+    </form>
+    }
 }
 
 proc tick setting {
@@ -1447,8 +1719,8 @@ proc tick setting {
 # Show a single article in raw unprocessed form
 proc show_article_raw {sock group num} {
     set art [get nh art $group $num]
-    html "<pre>\n[enpre $art]\n</pre>\n"
-    Httpd_ReturnData $sock {text/html; charset=utf-8} [encoding convertto $html]
+    html "<pre>\n[enpre1 $art]\n</pre>\n"
+    $sock htmlResponse $html
 }
 
 # create rot13 map on startup
@@ -1477,28 +1749,51 @@ proc toggle_pref {urec sock pref} {
 
     userdb eval {UPDATE users SET params = $params WHERE num = $user}
 
-    Httpd_Redirect [GetRefer $sock] $sock
+    set referer [$sock getHeader referer]
+    if {$referer eq {}} {set referer /}
+    $sock redirect $referer
+}
+
+# Switch the rot13 setting on/off, for current article only
+proc toggle_rot13 {urec sock} {
+    lassign $urec user can_post params
+
+    set missing [GetQuery $sock group num]
+    if {[llength $missing]} {
+        $sock errorResponse 400
+        return
+    }
+    set rot13 0
+    GetStash r$user.$group.$num rot13
+    set rot13 [expr {$rot13==1 ? 0 : 1}]
+    PutStash r$user.$group.$num rot13
+
+    set referer [$sock getHeader referer]
+    if {$referer eq {}} {set referer /}
+    $sock redirect $referer
 }
 
 
 # Show block confirm/cancel page
-proc /do/block {name address group num} {
-    html "<h3>Block User '[enpre $name]'</h3>"
-    html "Proceeding will hide all messages from address '$address'"
-    html {<br/><br/>
-    <form action='/block' method='post'>}
-    html {<input type=submit value='Confirm Block' class='bbut' />}
-    html "<input type=submit value='Cancel' formaction='/$group/$num' formtarget='_top' class='bbut' />"
-    html "<input type='hidden' name='address' value='$address' />"
-    html </form>
-    return $html
+proc do_block sock {
+    set missing [GetQuery $sock name address group num]
+    if {[llength $missing]} {return "<h3>Missing fields: $missing.</h3>"}
+
+    tmpl html {<h3>Block User '[enpre1 $name]'</h3>
+    Proceeding will hide all messages from address '$address'
+    <br/><br/>
+    <form action='/block' method='post'>
+    <input type=submit value='Confirm Block' class='bbut' />
+    <input type=submit value='Cancel' formaction='/$group/$num' formtarget='_top' class='bbut' />
+    <input type='hidden' name='address' value='$address' />
+    </form>}
+    $sock htmlResponse $html
 }
 
 # Block unwanted address
 proc save_block {urec sock} {
     lassign $urec user can_post params
-    upvar #0 Httpd$sock data
-    set query [Url_DecodeQuery $data(query)]
+    set query [$sock getFormdata]
     if {! [dict exists $query address]} return
     set address [string trim [dict get $query address]]
 
@@ -1508,7 +1803,7 @@ proc save_block {urec sock} {
     html "<h3>Address '$address' Now Blocked</h3>\n"
     html {The list of blocked addresses can be seen and edited by clicking Preferences.<br/>}
 
-    Httpd_ReturnData $sock {text/html; charset=utf-8} [encoding convertto $html]
+    $sock htmlResponse $html
 }
 
 set param_defaults {
@@ -1521,6 +1816,11 @@ set param_defaults {
     xhdrs {}
     r13 0
     apt 0
+    orgn {}
+    fupto 0
+    narch 0
+    face {}
+    xface {}
 }
 
 set colour_defaults {
@@ -1538,14 +1838,28 @@ set colour_defaults {
 
 # Edit user's preferences
 proc edit_prefs {urec sock} {
-    lassign $urec user can_post params
+    lassign $urec user can_post params ugrps
+    html {
+<script type='text/javascript'>
+function setProto(event) {
+	navigator.registerProtocolHandler('news', event.target.dataset.handler);
+	event.target.style.color = 'green';
+}
+function setup() {
+        let protoButton = document.getElementById('ph');
+       	protoButton.disabled=false;
+       	protoButton.addEventListener('click', setProto);
+}
+</script>
+    }
+
+
     html "<h3>Preferences for [expr {$can_post ? "User " : "Guest "}] $user</h3>\n"
 
     dict with params {}
     set blocks [join $block \n]
 
     # ugrp stores User GRouP info
-    set ugrps [redis hgetall "ugrp $user"]
     set groups {}
     foreach {group ugrp} $ugrps {
         lassign $ugrp last
@@ -1555,10 +1869,8 @@ proc edit_prefs {urec sock} {
     html {
 <form action='/save_prefs' method='post'>}
 
-    html [pref_label {Groups To Show:<br/>
-<em><span style='font-size: small'>(Each line lists one group, optionally
-followed by the highest article number when you last read this group.)
-</span></em>}]
+    html [pref_label "Groups To Show:<br/>[pref_notes {(Each line lists one group,
+    optionally followed by the highest article number when you last read this group.)}]"]
     html "<textarea name='groups' rows='10' cols='50'>$groups</textarea><br/>"
 
     html [pref_label {Newest Threads:}]
@@ -1566,45 +1878,68 @@ followed by the highest article number when you last read this group.)
 "<input type='radio' name='rev' value='0' [expr {$rev ? "" : "checked='checked'"}] />Last " \
 "<input type='radio' name='rev' value='1' [expr {$rev ? "checked='checked'" : ""}] />First "
 
-    html [pref_label {<br/>Blocked Posters:
-<br/><em><span style='font-size: small'>(Hide posts from these addresses,
-listed one per line.)</span></em>}]
+    html [pref_label "<br/>Blocked Posters:<br/>[pref_notes {(Hide posts from these
+        addresses, listed one per line.)}]"]
     html {<br/>
 <textarea name='blocks' rows='10' cols='50'>} \
     "$blocks</textarea><br/>"
 
     html [pref_label {Markup in Posts:}]
-    html \
-"<input type='radio' name='mup' value='0' [expr {$mup ? "" : "checked='checked'"}] />Off " \
-"<input type='radio' name='mup' value='1' [expr {$mup ? "checked='checked'" : ""}] />On" \
-{ <em><span style='font-size: small'>
-(*words* => bold, /words/ => italic, _words_ => underlined)</span></em><br/>}
+    html [off_on_input mup {*words* => bold, /words/ => italic, _words_ => underlined}]
 
     html [pref_label {Wrap Long Lines:}]
-    html \
-"<input type='radio' name='flo' value='0' [expr {$flo ? "" : "checked='checked'"}] />Off " \
-"<input type='radio' name='flo' value='1' [expr {$flo ? "checked='checked'" : ""}] />On" \
-{ <em><span style='font-size: small'>
-(use proportional font and wrap long lines)</span></em><br/>}
+    html [off_on_input flo {use proportional font and wrap long lines}]
 
     html [pref_label {All Thread Posts:}]
-    html \
-"<input type='radio' name='apt' value='0' [expr {$apt ? "" : "checked='checked'"}] />Off " \
-"<input type='radio' name='apt' value='1' [expr {$apt ? "checked='checked'" : ""}] />On" \
-{ <em><span style='font-size: small'>
-(show all posts in a thread instead of one at a time)</span></em><br/><br/>}
+    html [off_on_input apt {show all posts in a thread instead of one at a time}]
 
+    html {<h4>Posting Identity</h4>}
     html [pref_label {Posting Name:}]
     html "<input type='text' name='from' value='$from' size='50' maxlength='50'/><br/>"
-
+    html [pref_label {Organization:}]
+    html "<input type='text' name='orgn' value='$orgn' size='50' maxlength='50'/><br/>"
     html [pref_label {<br/>Signature:}]
     html "<textarea name='sig' rows='4' cols='70'>$sig</textarea><br/>"
+    html [pref_label {New Password:} 30%]
+    html {<input type='password' name='pass1' maxlength='100'/><br/>}
+    html [pref_label {Repeat Password:} 30%]
+    html {<input type='password' name='pass2' maxlength='100'/>}
+    html {<input type=submit value='Change password' formaction='/change_pass' class='bbut' }
+    if {! $can_post} {html "disabled='disabled' "}
 
-    html [pref_label {Extra Headers:<br/><em><span style='font-size: small'>
-(Leave this empty unless you really know what you're doing)</span></em>}]
-    html "<textarea name='xhdrs' rows='4' cols='70'>$xhdrs</textarea><br/><br/>"
+    html {/> <h4>Optional Posting Headers</h4>}
+    html [pref_label {Followup-to:}]
+    html [off_on_input fupto {show entry for this header in the posting screen}]
+    html [pref_label {X-No-Archive:}]
+    html [off_on_input narch {request that your posts should not be archived}]
+    set fid [clock milliseconds]
+    html [pref_label {X-Face:}]
+    if {$xface ne {}} {
+        set png [get nh face $xface]
+        PutStash tmp_face_$fid png
+        html "<img src='/tmp_face/$fid.png' alt='none' align='top' >\n"
+    } else {
+        html none
+    }
+    html {<input type=submit value='Set new image' formaction='/pref_xface' class='bbut' />}
+    html [pref_notes {(48x48 pixel monochrome icon)}] {<br/>}
+    html [pref_label {Face:}]
+    if {$face ne {}} {
+        set png [binary decode base64 $face]
+        incr fid
+        PutStash tmp_face_$fid png
+        html "<img src='/tmp_face/$fid.png' alt='none' align='top' >\n"
+    } else {
+        html none
+    }
+    html {<input type=submit value='Set new image' formaction='/pref_face' class='bbut' />}
+    html [pref_notes {(48x48 pixel colour icon)}] {<br/>}
 
-    html [pref_label {Colours:}]
+    html [pref_label "Extra Headers:<br/>[pref_notes {(Leave this empty
+        unless you really know what you're doing)}]"]
+    html "<textarea name='xhdrs' rows='4' cols='80'>$xhdrs</textarea><br/>"
+
+    html {<h4>Colours</h4>}
     html "<div style='text-align:right; white-space:pre; display:grid; grid-template-columns: repeat(4, max-content)'>"
     html [colour_input {General Background:} gen_bg]
     html [colour_input { Text:} gen_fg]
@@ -1624,24 +1959,38 @@ listed one per line.)</span></em>}]
 <input type=submit value='Save' class='bbut'/>
 <input type=submit value='Cancel' formaction='/' class='bbut' />
 <input type=submit value='Reset Colours to Defaults' formaction='/reset_colours' />
-</form>}
+<button id='ph' type='button' disabled='disabled' }
+    html "data-handler='https://$::this_site/%s'>Handle news: Links</button></form>"
     return $html
 }
 
-proc pref_label text {
-    return "\n<span style='clear: left; width: 20%; float: left'>$text</span>\n"
+proc pref_label {text {width 20%}}  {
+    return "\n<span style='clear: left; width: $width; float: left'>$text</span>\n"
+}
+
+proc pref_notes text {
+    return "<em><span style='font-size: small'>$text</span></em>"
+}
+
+proc off_on_input {var text} {
+    upvar $var val
+    html "<input type='radio' name='$var' value='0' "
+    html "[expr {$val ? "" : "checked='checked'"}] />Off "
+    html "<input type='radio' name='$var' value='1' "
+    html "[expr {$val ? "checked='checked'" : ""}] />On "
+    html "[pref_notes ($text)] <br/>"
+    return $html
 }
 
 proc colour_input {text var} {
     upvar $var val
-    return "<span>$text</span><input type='color' name='$var' value='$val' />"
+    return "<span style='min-width: 4em'>$text</span><input type='color' name='$var' value='$val' />"
 }
 
 # Save user's preferences
 proc save_prefs {urec sock} {
-    lassign $urec user can_post
-    upvar #0 Httpd$sock data
-    set query [Url_DecodeQuery $data(query)]
+    lassign $urec user can_post params
+    set query [$sock getFormdata]
     # Check colour settings are not something dodgy
     foreach field {gen_bg gen_fg new_bg new_fg rep_bg rep_fg sel_bg sel_fg quo_bg quo_fg} {
         if {[regexp {[^[:alnum:]#]} [dict getdef $query $field {}]]} { 
@@ -1660,7 +2009,7 @@ proc save_prefs {urec sock} {
         lappend blocklist [string trim $block]
     }
     dict set query block $blocklist
-    set params [dict get $query]
+    set params [dict merge $params $query]
     userdb eval {UPDATE users SET params = $params WHERE num = $user}
 
     set grouplist {}
@@ -1676,7 +2025,9 @@ proc save_prefs {urec sock} {
     redis hset "ugrp $user" {*}$grouplist
 
     clearThreadinfo $user
-    Httpd_Redirect / $sock
+    html {<h3>Preferences Saved.</h3>}
+    html {<form action='/' method='post'>}
+    html {<input type=submit value='Continue' style='width: 20%' /></form>}
 }
 
 # Reset user's colour preferences to the defaults
@@ -1685,53 +2036,216 @@ proc reset_colours {urec sock} {
     set params [dict merge $params $::colour_defaults]
     userdb eval {UPDATE users SET params = $params WHERE num = $user}
 
-    Httpd_Redirect / $sock
+    $sock redirect /
+}
+
+# Set user's Face image
+proc pref_face {urec sock fx id} {
+    lassign $urec user can_post params ugrps
+    set xface [expr {$fx == {x}}]
+    set X [expr {$xface ? "X-" : ""}]
+    html "<h3>Set ${X}Face image for User $user</h3>\n"
+
+    set note "(This is a 48-pixel-square [expr {$xface ? "monochrome" : "colour"}] \
+        image encoded in the ${X}Face header added to your posts. \
+        [expr {$xface ? "Many" : "Some"}] Usenet clients \
+        will display this when showing your posts.)"
+
+    html "<span style='width: 50%; float: right'>"
+    html "[pref_notes $note] </span>"
+
+    set leftish "\n<span style='clear: left; width: 20%; float: left'>"
+    html $leftish {Current image:<br/>}
+    set data [dict get $params ${fx}face]
+    if {$data ne {}} {
+	if {$xface} {
+            set png [get nh face $data]
+	} else {
+            set png [binary decode base64 $data]
+	}
+        set old [clock milliseconds]
+        PutStash tmp_face_$old png
+        html "<form action='/save_face' method='post' style='display: inline'>\n"
+        html "<input type='hidden' name='xface' value='$xface' />\n"
+        html "<input type='hidden' name='id' value='0' />\n"
+        html "<input type='submit' value='Delete image' class='but'/>\n"
+        html "</form></span>"
+        html "<img src='/tmp_face/$old.png' alt='none' align='top' >\n"
+    } else {
+        html {</span> none}
+    }
+
+    html {<br/><br/>}
+    html {<form ENCtype='multipart/form-data' action='/load_face' method='post' >}
+    html $leftish {Set image file:<br/>}
+    html "<input type=submit value='Load' class='but'/></span>\n"
+    html "<input type=file name='imagefile' accept='image/*'/>\n"
+    html "<input type='hidden' name='xface' value='$xface' />\n"
+    html "</form><br/><br/>"
+
+    html $leftish {New image:<br/>}
+    if {$id eq {}} {
+        html {</span> none}
+    } else {
+        html "<form action='/save_face' method='post' style='display: inline'>\n"
+        html "<input type='hidden' name='xface' value='$xface' />\n"
+        html "<input type='hidden' name='id' value='$id' />\n"
+        html "<input type='submit' value='Use this image' class='but'/></form>\n"
+        html "</span><img src='/tmp_face/$id.png' alt='none' align='top' >\n"
+    }
+
+    html "<br/><br/><em>or</em><br/>"
+    html "<form action='/face_data' method='post' style='display: inline'>\n"
+    html $leftish "Enter ${X}Face data:<br/>"
+    html "<input type=submit value='Load' class='but'/></span>\n"
+    html "<textarea name='data' rows='4' cols='80'></textarea><br/>"
+    html "<input type='hidden' name='xface' value='$xface' />\n"
+    html "</form>"
+
+    html "<br/><form action='/preferences' method='post'>\n"
+    html "<input type='submit' value='Cancel' class='but'/></form>\n"
+    return $html
+}
+
+proc load_face sock {
+    set formdata [$sock getFormdata]
+    set imagefile [dict getdef $formdata imagefile {}]
+    if {$imagefile eq {}} {
+        $sock errorResponse 404 "Failed to find new face data."
+        return
+    }
+    set id [clock milliseconds]
+    set out [open "| anytopnm | pamscale -width 48 -height 48 > uploads/$id 2> /dev/null" wb]
+    puts -nonewline $out $imagefile
+    close $out
+
+    set xface [dict getdef $formdata xface 0]
+    if {$xface} {
+        exec ppmtopgm uploads/$id | pgmenhance -5 | pamditherbw > uploads/$id.bw 2> /dev/null
+
+        set in [open "| pnmtopng -quiet uploads/$id.bw" rb]
+        set png [read $in]
+        close $in
+        set in [open "| pamtopnm -quiet uploads/$id.bw | pbmtoxbm -quiet | compface" rb]
+        set data [read $in]
+        close $in
+        set data [string trim $data]
+        PutStash tmp_face_$id png data
+        $sock redirect /pref_xface$id
+    } else {
+
+        for {set colours 16} {$colours > 1} {incr colours -1} {
+            set in [open "| pnmquant -quiet $colours uploads/$id | pnmtopng" rb]
+            set png [read $in]
+            close $in
+	    if {[string length $png] <= 720} break
+        }
+        set data [binary encode base64 -maxlen 78 -wrapchar "\n " $png]
+        PutStash tmp_face_$id png data
+        $sock redirect /pref_face$id
+    }
+}
+
+proc face_data {urec sock} {
+    lassign $urec user can_post params
+    set data {}
+    GetQuery $sock data xface
+    set data [string trim $data]
+    if {$data eq {}} {
+        $sock errorResponse 400 "Failed to find new face data."
+        return
+    }
+    set id [clock milliseconds]
+    if {$xface} {
+        set png [get nh face $data]
+        PutStash tmp_face_$id png data
+        $sock redirect /pref_xface$id
+    } else {
+        set png [binary decode base64 $data]
+        PutStash tmp_face_$id png data
+        $sock redirect /pref_face$id
+    }
+}
+
+proc tmp_face {sock id} {
+    $sock cacheMaxAge 300
+    GetStash tmp_face_$id png
+    if {! [info exists png]} {
+        $sock errorResponse 404 "Failed to find new face data."
+	return
+    }
+    $sock dataResponse $png image/png
+}
+
+proc save_face {urec sock} {
+    lassign $urec user can_post params
+    set id none
+    GetQuery $sock id xface
+    if {$id} {
+        GetStash tmp_face_$id data
+        if {! [info exists data]} {
+            $sock errorResponse 400 "Failed to find new face data for id=$id."
+	    return
+        }
+        if {$xface} {
+            dict set params xface $data
+        } else {
+            dict set params face $data
+        }
+    } else {
+        if {$xface} {
+            dict unset params xface
+        } else {
+            dict unset params face
+        }
+    }
+    userdb eval {UPDATE users SET params = $params WHERE num = $user}
+    $sock redirect /preferences
 }
 
 # remove group from the user's home page
 proc hide_group {sock urec group} {
     lassign $urec user can_post
     redis hdel "ugrp $user" $group
-    Httpd_Redirect / $sock
+    distcl::forget redis nh counts $user
+    $sock redirect /
 }
 
-# Implement a simple cache, shared between threads
-package require Thread
+# Implement simple caching using global dicts
 
-# Calculate and cache article thread info which depends on user, group and upto
-proc cacheThreadinfo {urec group upto} {
+# Calculate and cache article thread info which depends on user, group and older
+proc cacheThreadinfo {urec group older sought} {
     if {[checkThreadinfoBypass $group]} {
-        tailcall calcThreadinfo $urec $group $upto
+        tailcall calcThreadinfo $urec $group $older $sought
     }
     lassign $urec user can_post params
-    set arglist [list $user $group $upto]
+    set arglist [list $user $group $older $sought]
     set now [clock seconds]
     set timeout 300
-    if {[tsv::get Threadinfo $arglist value]} {
-        lassign $value time data
+    if {[dict exists $::Threadinfo $arglist]} {
+        lassign [dict get $::Threadinfo $arglist] time data
         if {$time + $timeout > $now} {
             return $data
         }
-        tsv::unset Threadinfo $arglist
     }
-    set data [calcThreadinfo $urec $group $upto]
-    tsv::set Threadinfo $arglist [list $now $data]
+    set data [calcThreadinfo $urec $group $older $sought]
+    dict set ::Threadinfo $arglist [list $now $data]
     return $data
 }
 
-# Calculate article thread info which depends on user, group and upto
-proc calcThreadinfo {urec group upto} {
-    lassign $urec user can_post params
+# Calculate article thread info which depends on user, group, older and sought
+proc calcThreadinfo {urec group older sought} {
+    lassign $urec user can_post params ugrps
     set blocklist [dict get $params block]
     set reverse [dict get $params rev]
 
-    set hdrs [get nh hdrs $group $upto]
-    #set hdrs [lsort -stride 2 -integer $hdrs]
+    get nh grup $group
+    set hdrs [get_hdrs $group $older $sought]
 
-    lassign [get_threads $hdrs $blocklist $user] threads blocked reply_nums
+    lassign [get_threads $hdrs $blocklist $user $sought] threads blocked reply_nums
     set threads [lsort -stride 2 -integer $threads]
 
-    lassign [redis hget "ugrp $user" $group] old_last
+    lassign [dict getdef $ugrps $group 0] old_last
 
     set threadcounts {}
     foreach {start_num thread} $threads {
@@ -1739,7 +2253,7 @@ proc calcThreadinfo {urec group upto} {
         set new_posts 0
         set replies 0
         foreach {num indent} $thread {
-            if {$num > $old_last} {
+            if {$num > $old_last && [check_xnew $urec $num $hdrs]} {
                 incr new_posts
                 if {$num in $reply_nums} {incr replies}
             }
@@ -1763,23 +2277,23 @@ proc calcThreadinfo {urec group upto} {
 }
 
 proc clearThreadinfo user {
-    foreach key [tsv::array names Threadinfo] {
-        if {[lindex $key 0] eq $user} {
-            tsv::unset Threadinfo $key
-        }
+    foreach key [dict keys $::Threadinfo "$user *"] {
+        dict unset ::Threadinfo $key
     }
 }
+set ::Threadinfo [dict create]
+set ::ThreadinfoBypass [dict create]
 
 proc bypassThreadinfo {group timeout} {
     set expiry [expr {[clock seconds] + $timeout}]
-    tsv::set ThreadinfoBypass $group $expiry
+    dict set ::ThreadinfoBypass $group $expiry
 }
 
 proc checkThreadinfoBypass group {
     set now [clock seconds]
-    if {[tsv::get ThreadinfoBypass $group expiry]} {
-        if {$now < $expiry} {return 1}
-        tsv::unset ThreadinfoBypass $group
+    if {[dict exists $::ThreadinfoBypass $group]} {
+        if {$now < [dict get $::ThreadinfoBypass $group]} {return 1}
+        dict unset ::ThreadinfoBypass $group
     }
     return 0
 }
@@ -1790,12 +2304,14 @@ proc PutStash {context args} {
         upvar $var st[incr n]
         lappend vars $var [set st$n]
     }
-    tsv::set Stash $context [list [clock seconds] $vars]
+    dict set ::Stash $context [list [clock seconds] $vars]
 }
+set Stash [dict create]
 
 proc GetStash {context args} {
     if {[llength $args] == 0} return
-    if {! [tsv::get Stash $context value]} {return $args}
+    if {! [dict exists $::Stash $context]} {return $args}
+    set value [dict get $::Stash $context]
     set stash [lindex $value 1]
     set missing {}
     foreach var $args {
@@ -1815,15 +2331,15 @@ proc cacheGC {} {
     set agelimit [expr {[clock seconds] - $::cacheMaxAge}]
 
     # remove old Stash entries
-    foreach {key value} [tsv::array get Stash] {
+    dict for {key value} $::Stash {
         if {[lindex $value 0] < $agelimit} {
-            tsv::unset Stash $key
+            dict unset ::Stash $key
         }
     }
     # remove old Threadinfo entries
-    foreach {key value} [tsv::array get Threadinfo] {
+    dict for {key value} $::Threadinfo {
         if {[lindex $value 0] < $agelimit} {
-            tsv::unset Threadinfo $key
+            dict unset ::Threadinfo $key
         }
     }
 }
@@ -1836,23 +2352,31 @@ proc doCacheGC {} {
     after $::cacheGCinterval doCacheGC
 }
 
-# Load group statuses and descriptions into thread-shared value.
-foreach {group stat desc} [get nh groupstats] {
-    catch {set desc [encoding convertfrom utf-8 $desc]}
-    tsv::set Groupstats $group [list $desc $stat]
-    incr numgroups
+# Load group statuses, descriptions and grpids into thread-shared value.
+proc load_groupstats {} {
+    overdb eval {SELECT name,stat,desc,rowid FROM groups} {
+        catch {set desc [encoding convertfrom utf-8 $desc]}
+        dict set ::Groupstats $name [list $desc $stat $rowid]
+        dict set ::Id2Group $rowid $name
+        incr ::numgroups
+    }
 }
+after idle load_groupstats
 
 proc groupstat group {
-    tsv::get Groupstats $group
+    dict getdef $::Groupstats $group {}
 }
+proc id2group grpid {
+    dict getdef $::Id2Group $grpid {}
+}
+set Groupstats [dict create]
+set Id2Group [dict create]
 
 # Look for specified variables in the request's data.
 # If found, set them in the caller's scope.
 # Return a list of any not found.
 proc GetQuery {sock args} {
-    upvar #0 Httpd$sock data
-    set query [Url_DecodeQuery $data(query)]
+    set query [$sock getFormdata]
     set missing {}
     foreach var $args {
         if {[dict exists $query $var]} {
@@ -1867,29 +2391,22 @@ proc GetQuery {sock args} {
     return $missing
 }
 
-proc GetRefer sock {
-    upvar #0 Httpd$sock data
-    if {[info exists data(mime,referer)]} {
-        return $data(mime,referer)
-    }
-    return /
-}
-
 # Run an article search and show the results
 proc show_art_search {sock urec group} {
-    lassign $urec user can_post
+    lassign $urec user can_post params ugrps
     set subj {}
     set from {}
     set date {}
     set nexttim {}
 
-    # Are we returning from viewing a search result?
+    # Are there previous parameters we should restore?
     set prev_result 0
-    set prev_result_re "[string map {. \\. + \\+} $group]/search/(\\d+)"
-    regexp $prev_result_re [GetRefer $sock] - prev_result
-    if {$prev_result} {GetStash s$user.$group subj from date}
-
+    set prev_result_re "[string map {. \\. + \\+} $group]/search/(\\d*)"
     if {[llength [GetQuery $sock clear]]} {
+        if {[regexp $prev_result_re [$sock getHeader referer] - num]} {
+            GetStash s$user.$group subj from date
+            if {$num ne {}} {set prev_result $num}
+        }
         GetQuery $sock subj from date nexttim
     }
     if {! [llength [GetQuery $sock more]]} {
@@ -1901,47 +2418,55 @@ proc show_art_search {sock urec group} {
         set tim [clock scan $date -format %Y-%m-%d]
     }
 
-    lassign [get nh find $group $subj $from $tim] more_tim hdrs
+    set allgroups [expr {$group eq "all.all"}]
+    if {! $allgroups} {
+        lassign [find_hdrs $group $subj $from $tim] more_tim hdrs
+    } else {
+        lassign [get nh findall $user $subj $from $tim] more_tim hdrs
+    }
 
-    html {
+    tmpl html {
 <script type='text/javascript'>
 function setup() {
 	document.getElementById('sel').focus();
 }
 </script>
-}
-    html {
+
 <form action='list' method='post'>
 <span style='float: right'>
 <input type='submit' value='Search' name='search' class='but' />
 <input type='submit' value='Clear' name='clear' class='but' />
 </span>
-    }
-    html "<input type='hidden' name='nexttim' value='$more_tim' />\n"
-    html "<h3>Search <a href='/$group'>$group</a> articles for</h3>"
-    html {
-<table><thead>
-<tr align='left'><th>Subject including</th><th>Author including</th><th>Date up to</th></tr>
+<input type='hidden' name='nexttim' value='$more_tim' />
+% if {$allgroups} {
+  <h3>Search articles in all my groups for</h3>
+  <table><thead> <tr align='left'> <th>Group</th>
+% } else {
+  <h3>Search <a href='/$group'>$group</a> articles for</h3>
+  <table><thead> <tr align='left'>
+% }
+<th>Subject including</th><th>Author including</th><th>Date up to</th></tr>
 <tr align='left'>
-    }
-    html "<th><input type='text' name='subj' size='50' value='$subj'/></th>"
-    html "<th><input type='text' name='from' size='30' value='$from'/></th>"
-    html "<th><input type='date' name='date' min='1987-01-01' value='$date'/></th>"
-    html {
+% if {$allgroups} {
+  <th/>
+% }
+<th><input type='text' name='subj' size='50' value='$subj'/></th>
+<th><input type='text' name='from' size='30' value='$from'/></th>
+<th><input type='date' name='date' min='1987-01-01' value='$date'/></th>
 </tr>
 </thead><tbody>
     }
 
-    lassign [redis hget "ugrp $user" $group] old_last
     set nums {}
-    foreach {num detail} $hdrs {
+    foreach detail $hdrs {
+        lassign $detail grpid sub frm num msgid xgrpids
         lappend nums $num
-        lassign $detail prev sub frm tim msgid
         set sub [encoding convertfrom $sub]
         set frm [encoding convertfrom $frm]
-        set dat [clock format $tim -format {%d %b %y}]
+        set dat [clock format $num -format {%d %b %y}]
+        lappend xgrpids $grpid
  
-        if {$num > $old_last} {
+        if {[check2_xnew $urec $num $msgid $xgrpids]} {
             html "<tr class='new'>"
         } else {
             html "<tr>"
@@ -1950,22 +2475,53 @@ function setup() {
         if {$num eq $prev_result} {
             set id " id='sel'"
         }
-        html "<td><a$id href=$num>[enpre $sub]</a></td>"
-	html "<td>[enpre $frm]</td><td>$dat</td></tr>\n"
+        if {$allgroups} {
+            set group [id2group $grpid]
+            html "<td>$group</td>"
+            set link "/$group/$num"
+        } else {
+            set link $num
+        }
+        html "<td><a$id href=$link>[enpre1 $sub]</a></td>"
+	html "<td>[enpre1 $frm]</td><td>$dat</td></tr>\n"
     }
-    html "<tr><td/><td/><td>"
-    html "<input type='submit' value='Earlier Dates' name='more' class='but' "
-    if {! $more_tim} {html "disabled='disabled' "}
-    html "/></td></tr>\n"
-    html "</tbody></table>\n"
-    html "</form>\n"
-
-    if {[llength $hdrs] == 0} {
-        html "<h3>No Matches Found</h3>"
+    tmpl html {<tr><td/><td/>
+% if {$allgroups} {
+    <td/>
+% }
+    <td><input type='submit' value='Earlier Dates' name='more' class='but' 
+% if {! $more_tim} {
+    disabled='disabled' 
+% }
+    /></td></tr>
+    </tbody></table>
+    </form>
+% if {[llength $hdrs] == 0} {
+    <h3>No Matches Found</h3>
+% }
     }
-    if {! $prev_result} {PutStash s$user.$group subj from date nums}
+    PutStash s$user.$group subj from date nums
 
     return $html
+}
+
+proc find_hdrs {group sub frm tim} {
+    set hdrs {}
+    lassign [groupstat $group] desc status grpid
+
+    set sql {SELECT sub,frm,dat,msgid,xgrpids FROM over WHERE grpid==$grpid }
+    if {$sub ne {}} {set sub %$sub%; append sql {AND sub LIKE $sub }}
+    if {$frm ne {}} {set frm %$frm%; append sql {AND frm LIKE $frm }}
+    if {$tim ne {}} {append sql {AND dat <= $tim }}
+    append sql {ORDER BY dat DESC}
+    append sql " LIMIT $::postbatch"
+    overdb eval $sql {
+        set sub [convertit $sub]
+        set frm [convertit $frm]
+        lappend hdrs [list $grpid $sub $frm $dat $msgid $xgrpids]
+    }
+    set more_dat [expr {[llength $hdrs]==$::postbatch ? [lindex $hdrs end 3] : 0}]
+    return [list $more_dat $hdrs]
 }
 
 # Show the group charter, if possible
@@ -1980,9 +2536,9 @@ proc show_charter group {
         uk {set url "https://www.usenet.org.uk/$group.html"}
 
         default {
-            set charter [get nu charter $group]
+            set charter [get nh charter $group]
             if {$charter eq {}} {set charter "Unable to retrieve charter."}
-            return [html "<pre>[enpre $charter]</pre>"]
+            return [html "<pre>[enpre1 $charter]</pre>"]
         }
     }
     html {<iframe style='position:fixed; right:0%; bottom:0%; height:80%; width:100%' }
@@ -2017,6 +2573,7 @@ proc compose_new {urec group args} {
     }
 
     set from [dict get $params from]
+    set fupto [dict get $params fupto]
     set sig [dict get $params sig]
     if {$sig ne {} && [string first "\n-- \r" $body] == -1} {
         append body "\n\n-- \n$sig"
@@ -2036,8 +2593,11 @@ any inappropriate groups</em></span><br/>}
 you are replying to has requested Followup-To the group above,
 please check that this is appropriate</em></span><br/>}
     }
-    html [form_field Subject subject $subject] \
-"<textarea name='body' rows='20' cols='80' wrap='off' style='font-size: large'>$body</textarea>" \
+    html [form_field Subject subject $subject]
+    if {$fupto} {
+        html [form_field Followup-To fupto {}]
+    }
+    html "<textarea name='body' rows='20' cols='80' wrap='off' style='font-size: large'>$body</textarea>" \
 {<br/>
 <input type=submit value='Post' style='width: 10em' />} \
     "<input type=submit value='Quit' style='width: 10em' formaction='/$group'/>" \
@@ -2049,7 +2609,7 @@ please check that this is appropriate</em></span><br/>}
 
 proc form_field {label name value} {
     html "<span style='font-size: large; width: 10em; float: left'>${label}:</span>"
-    html "<input type='text' name='$name' size='70' value='[enpre $value]' />"
+    html "<input type='text' name='$name' size='70' value='[enpre1 $value]' />"
     html "<br clear='left'/>\n"
 }
 
@@ -2074,11 +2634,7 @@ proc compose_reply {urec group num} {
     } else {
         set subject "Re: $old_sub"
     }
-    if {[dict exists $headers Message-ID]} {
-        set msgid [dict get $headers Message-ID]
-    } else {
-        set msgid [dict get $headers Message-Id]
-    }
+    set msgid [dict get $headers Message-ID]
     if {[dict exists $headers References]} {
         set refs "[dict get $headers References] $msgid"
     } else {
@@ -2089,7 +2645,7 @@ proc compose_reply {urec group num} {
         if {$line eq "-- "} break
         append body "> $line\n"
     }
-    return [compose_new $urec $group $groups $subject $refs $body]
+    tailcall compose_new $urec $group $groups $subject $refs $body
 }
 
 # Send a new post to the news server
@@ -2099,24 +2655,21 @@ proc do_post {urec sock} {
         return {<br/><span style='color:red'><em>
             Sorry, you need to register and log in to post.</em></span>}
     }
-
-    upvar #0 Httpd$sock data
-    set query [Url_DecodeQuery $data(query)]
-    foreach field {from subject group groups refs body} {
-        if {! [dict exists $query $field]} {
-	    return "<br/><em>Post failed: '$field' missing.</em>"
-	}
-        set $field [string trim [dict get $query $field]]
+    
+    set fupto {}
+    set missing [GetQuery $sock from subject group groups refs body fupto]
+    if {[llength $missing]} {
+        return "<br/><em>Post failed: '$missing' missing.</em>"
     }
     foreach field {from subject groups body} {
         if {[set $field] eq ""} {
             set msg "[string totitle $field] cannot be empty"
-            return [compose_new $urec $group $groups $subject $refs $body $msg]
+            tailcall compose_new $urec $group $groups $subject $refs $body $msg
         }
     }
     set grouplist [split $groups ,]
     if {[catch {moderated $grouplist} moderated]} {
-        return [compose_new $urec $group {} $subject $refs $body $moderated]
+        tailcall compose_new $urec $group {} $subject $refs $body $moderated
     }
     if {$moderated} {
         set wait_until [morphing_check $user $::morph_timeout]
@@ -2142,6 +2695,9 @@ proc do_post {urec sock} {
     if {$refs ne {}} {
         append txt "References: $refs\n"
     }
+    if {$fupto ne {}} {
+        append txt "Followup-To: $fupto\n"
+    }
     set date [clock format [clock seconds] -format {%a, %d %b %Y %H:%M:%S GMT} -gmt true]
     append txt "Date: $date\n"
     append txt {Mime-Version: 1.0
@@ -2155,6 +2711,16 @@ Content-Transfer-Encoding: 8bit
     }
     append txt "User-Agent: Newsgrouper/$::ng_version\n"
 
+    if {[dict get $params narch]} {append txt "X-No-Archive: yes\n"}
+    if {[dict get $params orgn] ne {}} {
+        append txt "Organization: [dict get $params orgn]\n"
+    }
+    if {[dict get $params xface] ne {}} {
+        append txt "X-Face: [dict get $params xface]\n"
+    }
+    if {[dict get $params face] ne {}} {
+        append txt "Face: [dict get $params face]\n"
+    }
     set xhdrs [dict get $params xhdrs]
     append txt [string trim [string map [list "\r\n" "\n"] $xhdrs]] "\n"
     catch {set body [encoding convertfrom $body]}
@@ -2196,7 +2762,7 @@ proc field_encode text {
 # match_desc is whether to match against the group description.
 proc groups_matching {pattern match_name match_desc} {
     set matched {}
-    foreach {group status} [tsv::array get Groupstats] {
+    dict for {group status} $::Groupstats {
         set desc [lindex $status 0]
         set match 0
         set fields {}
@@ -2212,49 +2778,93 @@ proc groups_matching {pattern match_name match_desc} {
     return [lsort -stride 2 $matched]
 }
 
-# Return the list of groups the user has previously read.
-# For each group returns name, description & number of new
-# posts since last read by this user.
-# The ugrp record for a user is a map from each group read to
-# the last article present when this user last read the group.
-proc groups_read user {
-    set result {}
-    set ugrps [redis hgetall "ugrp $user"]
+# Get the header info for the 500 most recent posts in a group,
+# and any older posts they link to. If 'older' is non-zero,
+# skip that number of new posts before starting.
+proc get_hdrs {group older sought} {
+    set ::msgid2num [dict create]
+    set ::missing_ref 0
+    set hdrs {}
+    set rev_hdrs {}
+    lassign [groupstat $group] desc status grpid
 
-    # kick off fetching the group counts so this can be done in parallel
-    foreach {group ugrp} $ugrps {
-        prefetch nh group $group
+    if {$sought} {
+        set sql {
+WITH RECURSIVE
+  ids(id) AS (
+    SELECT msgid FROM over WHERE grpid==$grpid AND dat==$sought
+    UNION
+    SELECT msgid FROM over,ids WHERE grpid==$grpid AND prev=id
+    UNION
+    SELECT prev FROM over,ids WHERE grpid==$grpid AND msgid=id AND prev!=''
+  )}
+    } else {
+        set sql {
+WITH RECURSIVE
+  mids(mid) AS (
+    SELECT msgid FROM over WHERE grpid==$grpid }
+    append sql {ORDER BY dat DESC}
+    append sql { LIMIT $::postbatch}
+    if {$older} {append sql { OFFSET $older}}
+    append sql {),
+  ids(id) AS (
+    SELECT mid FROM mids
+    UNION
+    SELECT prev FROM over,ids WHERE grpid==$grpid AND msgid=id AND prev!=''
+  )}
     }
+    append sql {
+SELECT sub,frm,dat,msgid,prev,xgrpids FROM over,ids WHERE grpid==$grpid AND msgid==id
+ORDER BY dat DESC
+}
 
-    foreach {group ugrp} $ugrps {
-        # The ugrp record may also contain a new value
-        # which should now replace the old one:
-        lassign $ugrp old_last new_last
-        if {$new_last ne {}} {
-            lappend ugrp_updates $group $new_last
-            set old_last $new_last
-        }
-        catch { # if group not found, skip it
-            lassign [groupstat $group] desc status
-            lassign [get nh group $group] est first last
-            set new [expr {max(0, $last - $old_last)}]
-            lappend result $group $desc $new
-        }
+    overdb eval $sql {
+        dict set ::msgid2num $msgid $dat
+        lappend rev_hdrs [list $prev $sub $frm $dat $msgid $xgrpids]
     }
-    if {[info exists ugrp_updates]} {
-        redis hset "ugrp $user" {*}$ugrp_updates
+    foreach hdr [lreverse $rev_hdrs] {
+        lassign $hdr prev sub frm dat msgid xgrpids
+
+        if {$prev eq {}} {
+            set prevnum 0
+        } else {
+            set prevnum [get_num $prev]
+        }
+
+        set sub [convertit $sub]
+        set frm [convertit $frm]
+        lappend hdrs $dat [list $prevnum $sub $frm $dat $msgid $xgrpids]
     }
-    return $result
+    return $hdrs
+}
+
+proc get_num msgid {
+    if {[dict exists $::msgid2num $msgid]} {
+        return [dict get $::msgid2num $msgid]
+    }
+    set num [incr ::missing_ref -1]
+    dict set ::msgid2num $msgid $num
+    return $num
+}
+
+proc convertit txt {
+    if {[catch {encoding convertto $txt} res]} {
+        #TODO Fix better?
+        return "ENCODING CONVERSION ERROR"
+    }
+    return $res
 }
 
 # Use the 'prev' links in the headers list to build the thread structure.
 # While doing this skip all posters the user has blocked.
+# If a specific article is sought (returned by a search) we include it
+# even if it would normally be blocked.
 # Returns a list alternating:
 #   - start of thread (article number)
 #   - list of articles in the thread and their indentation level.
 # Also returns total number of blocked posts,
 # and list of replies to current user's posts.
-proc get_threads {hdrs blocklist user} {
+proc get_threads {hdrs blocklist user sought} {
     set blocks 0
     set redirects [dict create]
     set ::followups [dict create]
@@ -2265,8 +2875,7 @@ proc get_threads {hdrs blocklist user} {
     set userposts {}
     set reply_nums {}
     foreach {num detail} $hdrs {
-        lassign $detail prev sub frm tim id
-        set sub [encoding convertfrom $sub]
+        lassign $detail prev sub frm
         set frm [encoding convertfrom $frm]
 
         if {[dict exists $redirects $prev]} {
@@ -2278,7 +2887,7 @@ proc get_threads {hdrs blocklist user} {
 	}
         set parsed [lindex [::mime::parseaddress $frm] 0]
         set address [dict getdef $parsed address $frm]
-        if {$address in $blocklist} {
+        if {$num != $sought && $address in $blocklist} {
 	    dict set redirects $num $prev
 	    incr blocks
 	    continue
@@ -2291,7 +2900,6 @@ proc get_threads {hdrs blocklist user} {
 	}
 
         # followups maps each article to the list of its direct replies
-        dict set ::followups $num {}
         if {$prev} {
 	    dict lappend ::followups $prev $num
 	    if {$prev in $userposts} {
@@ -2305,7 +2913,9 @@ proc get_threads {hdrs blocklist user} {
 
     foreach num $all_starts {
         set ::post_indent {}
+        set ::thread_latest 0
         do_thread $num 0
+        #lappend threads $::thread_latest $::post_indent
         set start [lindex $::post_indent 0]
         lappend threads $start $::post_indent
     }
@@ -2314,13 +2924,19 @@ proc get_threads {hdrs blocklist user} {
 
 # recursively build the structure of one thread into ::post_indent
 proc do_thread {num indent} {
+    if {$num > $::thread_latest} {set ::thread_latest $num}
     if {$num > 0} {
         lappend ::post_indent $num $indent
     }
-    set fups [dict get $::followups $num]
+    set fups [dict getdef $::followups $num {}]
     incr indent [llength $fups]
+    set lastf [lindex $fups end]
     foreach f $fups {
-        do_thread $f [incr indent -1]
+        if {$f != $lastf} {
+            do_thread $f [incr indent -1]
+        } else {
+            tailcall do_thread $f [incr indent -1]
+        }
     }
 }
 
@@ -2351,12 +2967,15 @@ proc parse_article {art} {
 
     if {[catch {::mime::getbody $bt -decode} body]} {
         if {[catch {::mime::getbody $bt} body2]} {
-            set body "ERROR \"$body2\" in ::mime::getbody"
+            set body "/ERROR \"$body2\" in ::mime::getbody/"
         } else {
-            set body "ERROR \"$body\" while decoding:\n\n$body2"
+            set body "/ERROR \"$body\" while decoding/:\n\n$body2"
         }
     }
     ::mime::finalize $mt
+    if {! [dict exists $headers Message-ID]} {
+        dict set headers Message-ID [dict getdef $headers Message-Id {}]
+    }
     return [list $headers [split $body \n]]
 }
 
@@ -2369,27 +2988,27 @@ proc parse_article_a art {
     return [list $headers $body]
 }
 
-# Get the image for an X-Face header from the nu (newsutility) service
+# Get the image for an X-Face header from the nh (newshub) service
 proc get_face {sock addr} {
-    Httpd_AddHeaders $sock Cache-Control max-age=300
-    set addr [Url_Decode $addr]
-    if {[tsv::get Faces $addr png] && $png ne {}} {
-        Httpd_ReturnData $sock image/png $png
+    $sock cacheMaxAge 300
+    set png [dict getdef $::Faces $addr {}]
+    if {$png ne {}} {
+        $sock dataResponse $png image/png
         return
     }
     set facedata [redis hget faces $addr]
     if {$facedata eq "(nil)"} {
-        Httpd_Error $sock 404 "Failed to find face data."
+        $sock errorResponse 404 "Failed to find face data."
         return
     }
-    if {[catch {get nu face $facedata} png]} {
-        Httpd_Error $sock 404 "Failed to decode face data '$png'."
+    if {[catch {get nh face $facedata} png]} {
+        $sock errorResponse 404 "Failed to decode face data '$png'."
         return
     }
-    tsv::set Faces $addr $png
-    Httpd_ReturnData $sock image/png $png
+    dict set ::Faces $addr $png
+    $sock dataResponse $png image/png
 }
-tsv::set Faces {} {}
+set Faces [dict create]
 
 # Send a new article to the news server using NNTP.
 # txt is the whole article.
@@ -2436,8 +3055,11 @@ proc morphing_check {user timeout} {
     redis zadd morphers $new_expiry_time $user
     return 0
 }
+set hour_secs [expr {60*60}];# 1 hour in seconds
 set day_secs [expr {60*60*24}];# 24 hours in seconds
 set week_secs [expr {$day_secs*7}];# 7 days in seconds
+set year_secs [expr {$day_secs*365}];# 365 days in seconds
+set hour_ms [expr {$hour_secs*1000}];# 1 hour in milliseconds
 
 set morph_limit 0
 #set morph_limit 5
@@ -2447,8 +3069,8 @@ set morph_reserve [expr {60*15}] ;# 15 minutes in seconds
 # Are any of these groups moderated?
 proc moderated groups {
     foreach group $groups {
-        if {[catch {groupstat $group} desc_stat]} {error "Invalid Group: '$group'"}
-        set status [lindex $desc_stat 1]
+        lassign [groupstat $group] desc status
+        if {$status eq {}} {error "Invalid Group: '$group'"}
         if {$status eq "m"} {return 1}
     }
     return 0
@@ -2482,8 +3104,28 @@ proc spam_check {user body grouplist {update 0}} {
 set spam_max_count 50
 set spam_max_volume 100000
 
+# Change user's password
+proc change_pass {urec sock} {
+    lassign $urec user can_post params
+
+    if {! $can_post} {
+        $sock errorResponse 403 {Close but no cigar!}
+        return
+    }
+    set missing [GetQuery $sock pass1 pass2]
+    if {[llength $missing] || $pass1 eq {} || $pass1 ne $pass2} {
+        $sock errorResponse 400 {Both passwords must be the same and non-empty.}
+        return
+    }
+    set enc_pass [md5crypt::md5crypt $pass1 $::user_salt]
+    userdb eval {UPDATE users SET pass = $enc_pass WHERE num = $user}
+
+    $sock redirect /
+}
+
 #### Site Status Stuff ####
 
+if 0 {
 # Online Safety Act survey for UK users
 proc need_survey {sock urec} {
     lassign $urec user can_post params
@@ -2499,7 +3141,7 @@ proc do_survey {sock suffix urec} {
     if {$suffix eq "skip"} {
         # Skip lasts for one day
         redis set "survey $user" skip ex $::day_secs
-        Httpd_Redirect / $sock
+        $sock redirect /
         return
     }
     set comment {}
@@ -2507,7 +3149,7 @@ proc do_survey {sock suffix urec} {
     if {$suffix eq "survey" && ! [llength $missing]} {
         set data [list $can_post $impact $comment]
         redis set "survey $user" $data
-        Httpd_Redirect / $sock
+        $sock redirect /
         return
     }
     html [heading $params]
@@ -2538,7 +3180,7 @@ Please rate how blocking access to Newsgrouper from UK IP addresses would affect
 <input type=submit value='Save' class='but' />
 <input type=submit value='Skip Today' formaction='/skip' class='but'/>
 </form></body>}
-    Httpd_ReturnData $sock {text/html; charset=utf-8} [encoding convertto $html]
+    $sock htmlResponse $html
 }
 
 # Warn UK user about impending OSA block
@@ -2556,7 +3198,7 @@ proc do_warn {sock suffix urec} {
     if {$suffix eq "warned"} {
         # Skip lasts for one week
         redis set "warn $user" skip ex $::week_secs
-        Httpd_Redirect / $sock
+        $sock redirect /
         return
     }
     html [heading $params]
@@ -2573,19 +3215,13 @@ Other web interfaces to Usenet are available, and may continue to allow UK users
 <form action='/warned' method='post'>
 <input type=submit value='Continue' class='but' />
 </form></body>}
-    Httpd_ReturnData $sock {text/html; charset=utf-8} [encoding convertto $html]
+    $sock htmlResponse $html
+}
 }
 
 # Block UK users due to Online Safety Act
-proc uk_user sock {
-    upvar #0 Httpd$sock data
-    if {! [info exists data(mime,cf-ipcountry)]} {return 0}
-    if {$data(mime,cf-ipcountry) ne "GB"} {return 0}
-    return 1
-}
-
 proc osa_block sock {
-    Httpd_Error $sock 451 {
+    $sock errorResponse 451 {
 <h1>Blocked due to UK Online Safety Act</h1>
 You appear to be connecting from an IP address in the United Kingdom.
 Unfortunately this site is no longer available to UK users.
@@ -2605,9 +3241,7 @@ Other web interfaces to Usenet are available, and may continue to allow UK users
 
 proc redirect_old_domain {sock suffix} {
     if {! [info exists ::old_site]} {return 0}
-    upvar #0 Httpd$sock data
-    if {! [info exists data(mime,host)]} {return 0}
-    if {$data(mime,host) ne $::old_site} {return 0}
+    if {[$sock getHeader host] ne $::old_site} {return 0}
     #after 2000
     if {[hack_attack $sock $suffix]} {return 1}
     #Httpd_Redirect https://$::this_site/$suffix $sock
@@ -2615,16 +3249,66 @@ proc redirect_old_domain {sock suffix} {
     html "<h1>Site Moved</h1>\n"
     html "<h3>Newsgrouper is now at <a href='https://$::this_site'>$::this_site</a></h3>"
     html "<h3>Please update your bookmarks.</h3>\n</body>"
-    Httpd_ReturnData $sock {text/html; charset=utf-8} [encoding convertto $html]
+    $sock htmlResponse $html
     return 1
 }
 
 proc show_down sock {
-    Httpd_Error $sock 503 {
+    $sock errorResponse 503 {
 <h1>Site down</h1>
 Sorry, Newsgrouper is not able to operate right now.
 <p/>
-There appears to be a fault with the upstream server news.eternal-september.org.
+The server is down for database maintenance.
 Newsgrouper will be back online as soon as possible.
                                                                      }
 }
+
+proc do_testy {urec sock} {
+    #coroutine::util after 10000
+    #error TESTY
+    set res [get nh testy [incr ::testy]]
+    return "TESTY $::testy res=$res"
+}
+
+proc daily_update {} {
+    distcl::get $::redis nh daily [clock format now -format %d]
+    after $::hour_ms daily_update
+}
+after $::hour_ms daily_update
+
+proc userError {uri errInfo} {
+    set date [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S} -gmt true]
+
+    if {[string range $errInfo 0 17] eq {database is locked}} {
+        set html {
+<h2>Database Locked</h2>
+Very sorry, we are experiencing a high volume of updates. :-( <br/>
+Your request is important to us!<br/>
+Please give it another try by <strong><em>reloading this page</em> [F5]</strong>.
+}
+        return [list 503 $html]
+    }
+
+    append html {
+<h1>Server Error</h1>
+500 apologies dear user! <br/>
+We most humbly regret that we have been unable to process your valued request for
+'} $uri {' at } $date { GMT. <br/>
+Please rest assured that those responsible have been alerted to this deplorable failure
+and will strive most urgently to correct it.
+}
+    return [list 500 $html]
+}
+
+::wibbly::serve -handler reqHandler -port [dict get $cmd_opts port] -error2user userError
+
+set sport [dict get $cmd_opts sport]
+if {$sport} {
+    package require tls
+    tls::init -keyfile certs/skey.pem -certfile certs/server.pem -require 0
+    ::wibbly::serve -handler reqHandler -port $sport -socketcmd ::tls::socket -error2user userError
+}
+
+puts RUNNING
+vwait godot
+

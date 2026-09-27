@@ -1,0 +1,76 @@
+#!/usr/local/bin/tcl
+# One-time script to de-dup dat timestamps for each group
+
+lassign $argv grpat
+if {$grpat eq {}} {puts "Usage: fix_dats <group-pattern>"; exit}
+
+set over_db /data/news_over.db
+
+package require sqlite3
+
+sqlite3 overdb $over_db
+overdb timeout 60000
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+if {$grpat eq "subscribed"} {
+    package require retcl
+    retcl create redis
+
+    set ugrps [redis -sync keys "ugrp *"]
+    foreach ugrp $ugrps {
+        set grpcounts [redis -sync hgetall $ugrp]
+        foreach {group count} $grpcounts {
+            #puts "$ugrp : $group $count"
+            set subgroups($group) $count
+        }
+    }
+    puts "Total subscribed groups: [array size subgroups]"
+    set groups [lsort [array names subgroups]]
+    #set groups [lsort -decreasing [array names subgroups]]
+    foreach group $groups {
+        set grpid [overdb eval {SELECT rowid FROM groups WHERE name==$group}]
+        lappend grps $group $grpid
+    }
+} elseif {$grpat eq "archiveonly"} {
+    set grps [overdb eval {SELECT name,rowid FROM groups WHERE servers=="" ORDER BY name}]
+} else {
+    set grps [overdb eval {SELECT name,rowid FROM groups WHERE name GLOB $grpat ORDER BY name}]
+}
+
+proc writeit data {
+    overdb transaction {
+        foreach {rid dat} $data {
+            overdb eval {UPDATE over SET dat=$dat WHERE rowid==$rid}
+        }
+    }
+}
+
+foreach {group gid} $grps {
+    puts $group
+    if {$group in {alt.sex.femdom}} continue
+    set lastdat 0
+    set data {}
+    set riddats [overdb eval {SELECT rowid,dat FROM over WHERE grpid==$gid ORDER BY dat}]
+    foreach {rid dat} $riddats {
+        if {$dat <= $lastdat} {
+            puts "$group: $dat -> [incr lastdat]   +[expr {$lastdat-$dat}]"
+            lappend data $rid $lastdat
+            if {[llength $data] > 100000} {
+                writeit $data
+                set data {}
+            }
+        } else {
+            set lastdat $dat
+        }
+    }
+    #puts "$group $count"
+    writeit $data
+
+    #overdb eval {UPDATE groups SET posts=$count WHERE name==$group}
+}
+

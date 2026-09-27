@@ -1,14 +1,18 @@
 #!/usr/local/bin/tclsh9.0
 
 # user_stats - count distinct users from the access logs
+#set filepat /tmp/log8015_2*gz
+#set filepat /tmp/wibbly8015_2*
+set filepat /tmp/wibbly.8016.2*
 
 set totalusers {}
 set countries {}
-foreach lf [lsort [glob /tmp/log8015_2*gz]] {
+foreach lf [lsort [glob $filepat]] {
     set dayusers {}
     set regdayusers {}
     set dayreqs 0
-    set if [open "| zcat $lf"]
+    #set if [open "| zcat $lf"]
+    set if [open $lf]
     while {[gets $if line] >= 0} {
         incr dayreqs
         lassign [split $line] country reg user

@@ -1,1 +1,1 @@
-tclsh9.0 tclhttpd3.5/bin/httpd.tcl -library server -debug 1
+tclsh9.0 news_code.tcl -port 8015 -sport 8016
