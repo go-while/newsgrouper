@@ -1,2 +1,3 @@
-https://chiselapp.com/user/cmacleod/repository/newsgrouper/info/5b52efec352c54c0
-User & Date:	cmacleod on 2026-09-25 13:50:49.312
+https://chiselapp.com/user/cmacleod/repository/newsgrouper/info/6095586578395f08
+SHA1:	6095586578395f0866e04423445d95150a870314
+User & Date:	cmacleod on 2026-10-10 10:20:53.274
