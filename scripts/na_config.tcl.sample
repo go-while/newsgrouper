@@ -1,3 +1,0 @@
-# Parameters for NNTP connection
-set nntp_server news.somenewshost.com
-#set nntp_port 12345

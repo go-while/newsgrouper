@@ -1,4 +1,0 @@
-# Parameters for NNTP connection
-set nntp_server news.somenewshost.org
-set nntp_user myusername
-set nntp_pass myuserpassword
