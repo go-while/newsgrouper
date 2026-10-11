@@ -1,0 +1,136 @@
+#!/usr/local/bin/tclsh9.0
+
+# NewsGetter - get data from the nntp server in response to redis requests.
+
+proc putd s {puts $s}
+
+set nntp_port 119
+lassign $argv service debug
+source ${service}_config.tcl
+source retcl.tm
+source distcl.tcl
+
+package require retcl
+retcl create redis
+
+source nntp.tcl; # For local fix
+package require nntp
+
+set debug [expr {$debug==1 ? 1 : 0}]
+
+# a little debugging helper
+proc printvars args {
+    foreach var $args {upvar $var pv[incr n]; puts -nonewline "$var='[set pv$n]' "}
+    puts {}
+}
+
+proc nntp_connect {} {
+    set ::nntp [::nntp::nntp $::nntp_server $::nntp_port]
+    $::nntp configure -binary 1 -debug $::debug
+    if {[info exists ::nntp_user]} {
+        $::nntp authinfo $::nntp_user $::nntp_pass
+    }
+}
+catch {
+    nntp_connect
+    puts [$nntp mode_reader]
+}
+
+proc nntp_retry script {
+    if {[catch {uplevel $::nntp $script} result]} {
+        set tim [clock format now -format {%d/%m %T}]
+        puts "$::service $tim CAUGHT: '$result'"
+        switch -glob $result {
+            {NNTPERROR: *} {error $result}
+            default {
+                puts "$::service $tim RETRYING: '$script'"
+	        catch {$::nntp quit}
+	        after 100
+	        nntp_connect
+	        uplevel $::nntp $script
+                puts "$::service $tim RETRY SUCCEEDED"
+            }
+        }
+    } else {
+        return $result
+    }
+}
+
+set week 604800; #seconds
+set day 86400  ; #seconds
+set hour 3600  ; #seconds
+set fivemin 300; #seconds
+set thisyear [clock format [clock seconds] -format %Y]
+
+proc execute {func args} {
+    lassign $args grp num num2
+    switch $func {
+        group {return -secs2keep 5 [groupinfo $grp]}
+        art {
+            groupinfo $grp
+            set val [nntp_retry {article $num}]
+            return -secs2keep $::week $val
+        }
+        mid {
+            # $grp is the message-id here
+            set val [nntp_retry {article $grp}]
+            return -secs2keep $::week $val
+        }
+        post {
+            # $grp is the article text here
+            set text [encoding convertfrom $grp]
+            return [nntp_retry {post $text}]
+        }
+        new {
+            lassign [nntp_retry {group $grp}] est first last
+            if {$last <= $num} {return [list 0 $last]}
+
+            set limit [expr {$last-999}]
+            set start [expr {max($first,$num+1,$limit)}]
+            set xover [nntp_retry {xover $start $last}]
+            if {$start>$limit} {set limit 0}
+            return [list $limit $last $xover]
+        }
+        newer {
+            lassign [nntp_retry {group $grp}] est first last
+            if {$last <= $num} {return [list 0 $last]}
+            set start [expr {max($first,$num+1)}]
+            if {$last-$start > 999} {return [list 1 $last]}
+            set xover [nntp_retry {xover $start $last}]
+            return [list 0 $last $xover]
+        }
+        backfill {
+            lassign [nntp_retry {group $grp}] est first last
+            if {$first > [incr num -1]} {return 0}
+
+            set limit [expr {$num-999}]
+            set start [expr {max($first,$limit)}]
+            set xover [nntp_retry {xover $start $num}]
+            if {$start>$limit} {set limit 0}
+            return [list $limit $xover]
+        }
+        grouplist {
+            return -secs2keep $::day [nntp_retry {list}]
+        }
+        desclist {
+            return -secs2keep $::day [nntp_retry {xgtitle *}]
+        }
+        xover {
+            nntp_retry {group $grp}
+            return [nntp_retry {xover $num $num2}]
+        }
+        default {
+            error "UNRECOGNISED REQUEST: '$func'"
+        }
+    }
+}
+
+proc groupinfo grp {
+    set groupinfo [nntp_retry {group $grp}]
+    return $groupinfo
+}
+
+proc keepalive {} {catch {nntp_retry date}}
+
+distcl::serve redis $service execute 300 keepalive
+

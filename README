@@ -1,0 +1,55 @@
+Newsgrouper - a web interface to usenet newsgroups
+
+This is the Tcl code used to run my site https://newsgrouper.org.uk.
+
+It is not currently in a form where it would be very easy for someone else to install, but I'm making it available just in case anyone is interested.
+
+I have moved confidential parameters like login credentials for the usenet server into config files, and I supply only dummy sample versions here. But there are many other things hard-coded which ideally would be configurable.
+
+Prerequisites
+
+    Tcl 9.0
+    Tk (only needed for the user_admin program)
+    Tcllib
+    Tclhttpd
+    TclTls (if https support is wanted)
+    Retcl (Tcl interface to Redis)
+    Tclsqlite (Tcl interface to sqlite)
+    Redis (any of the compatible forks should also work but I have not tested this)
+    NNTP access to a usenet server
+    A functioning UUCP setup, if posts are to be sent via uucp
+    X-Face support needs the uncompface program (for Debian this is part of the compface package)
+    Archive search needs the mboxgrep program (for Debian this is in the mboxgrep package)
+
+Downloads
+
+You can download the code from https://chiselapp.com/user/cmacleod/repository/newsgrouper/download .
+
+Architecture
+
+Newsgrouper loads news headers and articles on-demand from one or more usenet servers. These are then cached locally for configurable times. This allows it to offer the full range of groups available on the server without needing huge local resources.
+
+The web server used here is Tclhttpd, which is itself implemented in Tcl. It is customised for this purpose by loading more Tcl code, principally server/news_code.tcl which generates all the Newsgrouper web pages on demand.
+
+Communication with the usenet server(s) is delegated to separate newsgetter processes. Each of these opens one NNTP connection to a usenet server. Most servers will permit up to 4 concurrent connections per login, so up to 4 newsgetter processes can be run per server.
+
+There is also a newsutility process, this generates PNG images from X-Face headers, retrieves newsgroup charters, searches the archive files, and does periodic processing of group read statistics.
+
+Coordination of these processes and caching of their results is done through Redis, using the DisTcl system - see https://wiki.tcl-lang.org/DisTcl for more info about this.
+
+User login info and preferences, both for registered users and guests, is kept in a single sqlite table. A utility program user_admin can be used to initialise the database and to add registered users.
+
+Other user-specific info like which groups they read is kept in Redis.
+
+The list of newsgroups and their descriptions is kept in Redis and needs to be initialised and updated by running scripts/newslist.  This also updates the statistics for global posting rates per group.
+
+License
+
+This software uses the ISC LICENSE:
+
+    Copyright (c) 2024 Colin G. Macleod
+
+    Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
