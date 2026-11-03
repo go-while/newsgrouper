@@ -128,7 +128,7 @@ proc ::nntp::nntp {{server ""} {port ""} {name ""}} {
     set data(binary) 0
 
     set sock [socket $data(host) $data(port)]
-
+    fconfigure $sock -translation crlf
     set data(sock) $sock
 
     # Create the command to manipulate the nntp connection
@@ -653,8 +653,9 @@ proc ::nntp::_stat {name {msgid ""}} {
 proc ::nntp::_quit {name} {
     upvar 0 ::nntp::${name}data data
 
-    set ret [::nntp::command $name "QUIT"]
-    close $data(sock)
+    set ret {}
+    catch {set ret [::nntp::command $name "QUIT"]}
+    catch {close $data(sock)}
     rename ${name} {}
     return $ret
 }
@@ -878,7 +879,10 @@ proc ::nntp::fetch {name} {
     }
 
     set result [list ]
-    while {![eof $sock]} {
+    while 1 {
+        if {[eof $sock]} {
+            error "nntp: unexpected EOF during multi-line response on $sock"
+        }
         gets $sock line
         regsub -- {\015?\012$} $line $data(eol) line
 
@@ -911,7 +915,7 @@ proc ::nntp::response {name} {
     set data(mesg) ""
 
     if {$line == ""} {
-        error "nntp: unexpected EOF on $sock\n"
+        error "nntp: unexpected EOF on $sock"
     }
 
     regsub -- {\015?\012$} $line "" line
@@ -920,8 +924,7 @@ proc ::nntp::response {name} {
             data(code) val1 val2 data(mesg)]
     
     if {$result == 0} {
-        puts stderr "nntp garbled response: $line\n";
-        return ""
+        error "nntp garbled response: $line"
     }
 
     if {$val1 == 20} {

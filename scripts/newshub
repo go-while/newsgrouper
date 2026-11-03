@@ -82,6 +82,7 @@ proc execute {func args} {
 	    return -secs2keep $::fivemin [find_all {*}$args]
         }
         face {
+            if {[string length $arg1] > 4096} {error "X-Face data too long"}
             set conversion [open "| uncompface -X | xbmtopbm | pnmtopng" wb+]
             puts -nonewline $conversion $arg1
             close $conversion write
@@ -93,8 +94,8 @@ proc execute {func args} {
 	    return -secs2keep $::days30 [get_charter $arg1]
         }
         testy {
-	    after 10000
-	    return "testified $data"
+	    #after 10000
+	    return "testified $arg1"
         }
         daily {
 	    return -secs2keep $::day [age_groupreads]
@@ -140,19 +141,21 @@ proc group_updater {group coro} {
         }
     }
     if {! $failed && $last > $old_last} {
+        if [catch {
 
-        if {$limit} {
-            # too far out-of-date, need to catchup
-            set xover [do_catchup $group $grpid $server $limit $xover]
-        }
-        if {$coro} {yield db}
+            if {$limit} {
+                # too far out-of-date, need to catchup
+                set xover [do_catchup $group $grpid $server $limit $xover]
+            }
+            if {$coro} {yield db}
 
 #printvars group_updater3 group
-        overdb eval {UPDATE counts SET last=$last WHERE grpid==$grpid AND server==$server}
-        if {! [overdb changes]} {
-            overdb eval {INSERT INTO counts(grpid,server,last) VALUES($grpid,$server,$last)}
-        }
-        group_store $group $xover
+            overdb eval {UPDATE counts SET last=$last WHERE grpid==$grpid AND server==$server}
+            if {! [overdb changes]} {
+                overdb eval {INSERT INTO counts(grpid,server,last) VALUES($grpid,$server,$last)}
+            }
+            group_store $group $xover
+        } err] {puts "group_updater $group $coro FAILED '$err'"; return}
     }
     if {! $coro} return
 
@@ -241,7 +244,7 @@ proc group_store {group xover} {
 
 #printvars group_store group
     set user_replies {}
-    append reply_re {\d+-(\d+)@} $::this_site
+    append reply_re {^\d+-(\d+)@} $::this_site $
 
     overdb transaction {
         set select {SELECT rowid FROM groups WHERE name == $group}
@@ -327,8 +330,9 @@ proc parse_over hdr {
         set date [regsub {\m(\d\d:\d\d)\s+[[:alpha:]/]+$} $date {\1}]
         #remove extra space before minutes
         set date [regsub {\m(\d\d): (\d\d:\d\d)\s.*$} $date {\1:\2}]
-        #set dat [clock scan $date]
-        set dat [clock scan $date -validate 0]
+        if {[catch {clock scan $date -validate 0} dat]} {
+	    set dat [clock seconds] ;# if all else fails, use "now".
+	}
     }
 
     return [list $sub $from $dat $msgid $prev $grps]
@@ -457,7 +461,7 @@ proc get_charter group {
 
     set hier [group_hier $group]
     set url "https://ftp.isc.org/usenet/control/$hier/$group.gz"
-    set ctlmsgs [open "| wget -q -O - $url | gunzip"]
+    set ctlmsgs [open "| wget -q --timeout=15 --tries=1 -O - $url | gunzip"]
     fconfigure $ctlmsgs -translation binary
 
     while 1 {

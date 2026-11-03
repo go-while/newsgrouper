@@ -70,7 +70,13 @@ proc serve {redis service proc {idlesecs 300} {idleproc {}}} {
         set runlist r:${service}:$request
         set runcount [$redis -sync rpush $runlist $is_get]
         # is the same request already running on another server?
-        if {$runcount > 1} continue
+        if {$runcount > 1} {
+            # Double-check that runlist eventually expires
+            if {[$redis -sync ttl $runlist] < 0} {
+                $redis -sync expire $runlist 20
+            }
+            continue
+        }
         $redis -sync expire $runlist 20
 
         # check if it's already cached

@@ -1,0 +1,22 @@
+mkdir logs
+sleep 1; ./newsgetter ng >logs/ng.1.log &
+sleep 1; ./newsgetter na >logs/na.1.log &
+#sleep 1; ./newsgetter nd >logs/nd.1.log &
+sleep 1; ./newsgetter np >logs/np.1.log &
+
+sleep 1; ./newsgetter ng >logs/ng.2.log &
+sleep 1; ./newsgetter na >logs/na.2.log &
+#sleep 1; ./newsgetter nd >logs/nd.2.log &
+sleep 1; ./newsgetter np >logs/np.2.log &
+
+sleep 1; ./newsgetter ng >logs/ng.3.log &
+sleep 1; ./newsgetter na >logs/na.3.log &
+#sleep 1; ./newsgetter nd >logs/nd.3.log &
+sleep 1; ./newsgetter np >logs/np.3.log &
+
+sleep 1; ./newsgetter ng >logs/ng.4.log &
+sleep 1; ./newsgetter na >logs/na.4.log &
+#sleep 1; ./newsgetter nd >logs/nd.4.log &
+sleep 1; ./newsgetter np >logs/np.4.log &
+
+#sleep 1; ./newsutility >logs/nu.log &

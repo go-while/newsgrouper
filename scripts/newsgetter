@@ -47,13 +47,12 @@ proc nntp_retry script {
 	        catch {$::nntp quit}
 	        after 100
 	        nntp_connect
-	        uplevel $::nntp $script
+	        set result [uplevel $::nntp $script]
                 puts "$::service $tim RETRY SUCCEEDED"
             }
         }
-    } else {
-        return $result
     }
+    return $result
 }
 
 set week 604800; #seconds

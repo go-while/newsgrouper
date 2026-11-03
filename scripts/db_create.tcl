@@ -12,7 +12,7 @@ sqlite3 odb $over_db
 sqlite3 adb $arch_db
 
 # rowid in the groups table is used as a compact id for a group (grpid)
-odb eval {CREATE TABLE groups(name TEXT PRIMARY KEY, posts INTEGER, servers TEXT)}
+odb eval {CREATE TABLE groups(name TEXT PRIMARY KEY, posts INTEGER, servers TEXT, stat TEXT, desc TEXT)}
 
 odb eval {CREATE TABLE over(grpid INTEGER, sub TEXT, frm TEXT, dat INTEGER, msgid TEXT, prev TEXT, xgrpids TEXT, PRIMARY KEY (grpid,msgid) ON CONFLICT IGNORE)}
 # A better primary key above would be (msgid,grpid) but it's late to change now.

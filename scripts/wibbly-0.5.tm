@@ -122,12 +122,18 @@ proc ::wibbly::dequery {str} {
     foreach elem [split $str &] {
         regexp {^([^=]*)(?:(=.*))?$} $elem _ key val
         if {$val ne ""} {
-            set val [list "" [dehex [string map {+ " "}\
-                [string range $val 1 end]]]]
+            set val [list "" [deutf8 [dehex [string map {+ " "}\
+                [string range $val 1 end]]]]]
         }
-        lappend query [dehex [string map {+ " "} $key]] $val
+        lappend query [deutf8 [dehex [string map {+ " "} $key]]] $val
     }
     return $query
+}
+
+# Decode characters from UTF-8, if possible
+proc ::wibbly::deutf8 {str} {
+    catch {set str [encoding convertfrom -profile strict utf-8 $str]}
+    return $str
 }
 
 # Encode by substituting most non-alphanumerics with hexadecimal codes.
@@ -214,8 +220,7 @@ proc ::wibbly::headers2string {header} {
     dict for {key val} $header {
         # Ensure line breaks in the value do not start a new header
         regsub -all {[\r\n]+} $val "\n " val
-        if {![llength $val]} continue
-        append str "$key: $val\n"
+        if {$val ne {}} {append str "$key: $val\n"}
     }
     return $str
 }
@@ -224,7 +229,7 @@ proc ::wibbly::headers2string {header} {
 proc ::wibbly::string2headers {str} {
     set header {}
     foreach {_ key raw} [regexp -all -inline -expanded -lineanchor {
-        ^( [^\s:]+ ) \s*:\s*
+        ^( [^\s:]+ ) :[ \t]*
         ( (?: [^\n] | \n[ \t] )* )
     } $str] {
         set key [string tolower $key]
@@ -442,6 +447,7 @@ proc ::wibbly::getrequest {params chan peerhost peerport} {
             set end [expr {[string first $sep $data $beg] - 1}]
             set post ""
             while {$beg < $end} {
+                set val {}
                 set beg [expr {[string first \n $data $beg] + 1}]
                 set part [string range $data $beg $end]
                 set split [string first \r\n\r\n $part]
@@ -496,15 +502,18 @@ proc ::wibbly::process {params socket peerhost peerport} {
             set request [getrequest $params $socket $peerhost $peerport]
             set wob [wobbly new $socket $request]
 	    try {
+                # Call the request handler.
                 [dict get $params -handler] $wob
+
+                # Send the response.
+                $wob sendresponse
+                set persist [$wob persistent]
             } finally {
                 set response [$wob getResponse]
+                $wob destroy
             }
-            # Send the response, and terminate or continue as requested.
-            $wob sendresponse
-            set persist [$wob persistent]
-            $wob destroy
 
+            # Write the log, and terminate or continue as requested.
             ::wibbly::logAccess $params $request $response
             if {$persist} {
                 catch {chan flush $socket}
@@ -607,14 +616,16 @@ proc ::wibbly::panic {params errInfo socket peerhost peerport request response} 
     ::wibbly::logAccess $params $request $response
 
     catch {
+        set body [encoding convertto utf-8 $message\n]
+        set reason [dict getdef $::wibbly::http_errors $code {Internal Server Error}]
         chan configure $socket -translation crlf
-        chan puts $socket\
-            "[dict get $request protocol] $code Internal Server Error\
-            \ncontent-type: text/html;charset=utf-8\
-            \ncontent-length: [string length $message]\
-            \nconnection: close\n"
-        chan configure $socket -translation lf -encoding utf-8
-        chan puts $socket $message
+        chan puts $socket "[dict get $request protocol] $code $reason
+content-type: text/html;charset=utf-8
+content-length: [string length $body]
+connection: close\n"
+        chan configure $socket -translation binary
+        chan puts $socket $body
+        chan close $socket
     }
 }
 
@@ -759,8 +770,6 @@ method sendresponse {} {
         }
         set file [dict get $response contentchan]
     } elseif {[dict exists $response content]} {
-        dict set response content [encoding convertto iso8859-1\
-            [dict get $response content]]
         set size [string length [dict get $response content]]
     }
 
@@ -922,7 +931,7 @@ while trying to obtain <b>%3$s</b>.
 
     dict set response status $code
     dict set response header content-type "text/html;charset=utf-8"
-    dict set response content $message
+    dict set response content [encoding convertto utf-8 $message]
 }
 
 # Sets the response to tell the client to redirect to the specified URL.
@@ -1017,6 +1026,7 @@ method startChunkedResponse {data {otherType {}}} {
     tailcall my moreChunkedResponse $data $otherType
 }
 
+# Continue sending a response using chunked transfer encoding
 method moreChunkedResponse {data {otherType {}}} {
     if {[dict exists $response aborted]} return
     if {$otherType eq {}} {
