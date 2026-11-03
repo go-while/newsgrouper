@@ -1,0 +1,451 @@
+#!/usr/local/bin/tclsh9.0
+
+# nntpd - an NNTP server on Newsgrouper's databases.
+#
+# For now it only accepts articles with IHAVE, so that archives can be
+# loaded with a feeder such as mbox2nntp
+# (https://github.com/go-while/mbox2nntp):
+#
+#     ./nntpd                                   (in the scripts directory)
+#     mbox2nntp -server 127.0.0.1:1119 -workers 16 comp.lang.tcl.mbox.zip
+#
+# Each article is stored the way db_load_arch stores it: the text in the
+# arts table of the archive db, and one row in the over table of the
+# overview db for every group in its Newsgroups header that is in the
+# groups table. Other groups are skipped, and an article with no known
+# group is refused (437).
+#
+# mbox2nntp counts a 437 as finished and still renames the input to .done,
+# so add the groups to the groups table before importing them. Or set
+# nntpd_create_groups to add unknown groups, as db_load_arch does; that adds
+# every group named in a cross-post too. newshub and the web server only
+# see a new group after a restart.
+#
+# 235 is only sent once the article is written. Articles arriving on
+# several connections at once are written in one transaction, so more
+# mbox2nntp workers load faster: on a test VM a 2333-article mbox took 78s
+# with 1 worker, 23s with 4 and 8s with 16. Feeding the same file again
+# costs little: every article is answered 435.
+#
+# mbox2nntp adds "mbox2nntp-FILENAME!" to the Path header, drops Xref and
+# Expires, and turns tabs in header lines into spaces.
+#
+# It listens on 127.0.0.1 only and asks for no password, so anyone with a
+# login on this machine can feed it. Run it while importing and stop it
+# afterwards.
+#
+# Commands are looked up in the ::commands table below, so reader commands
+# (GROUP, OVER, ARTICLE, ...) can be added later for read-only access.
+
+source config.tcl
+package require sqlite3
+package require mime
+
+# Settings which config.tcl may override
+foreach {var val} {
+    nntpd_port          1119
+    nntpd_create_groups 0
+    nntpd_max_article   2097152
+    nntpd_max_line      1048576
+    nntpd_timeout       300
+    blocked_groups      {}
+} {
+    if {! [info exists $var]} {set $var $val}
+}
+
+sqlite3 overdb $over_db
+overdb timeout 60000
+sqlite3 archdb $arch_db
+archdb timeout 60000
+
+# Hack to avoid ::mime::field_decode failure on Chinese posts using charset
+# GBK, as in db_load_arch.
+set ::mime::reversemap(gbk) gb2312
+
+proc log msg {
+    puts "[clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] $msg"
+    flush stdout
+}
+
+# ============================ connection handling ============================
+
+proc accept {sock host port} {
+    chan configure $sock -blocking 0 -translation binary -buffering full
+    coroutine conn$sock session $sock $host:$port
+}
+
+proc session {sock peer} {
+    try {
+        reply $sock "201 Newsgrouper nntpd ready (transit only)"
+        while 1 {
+            set line [readline $sock]
+            if {[string length $line] > 512} {
+                reply $sock "501 Command line too long"
+                continue
+            }
+            set argv [split [string trim $line]]
+            set cmd [string toupper [lindex $argv 0]]
+            set argv [lrange $argv 1 end]
+            if {$cmd eq "MODE" && [string toupper [lindex $argv 0]] eq "READER"} {
+                reply $sock "502 Reading is not available yet"
+            } elseif {[dict exists $::commands $cmd]} {
+                if {[[dict get $::commands $cmd] $sock $argv] eq "quit"} break
+            } else {
+                reply $sock "500 Unknown command"
+            }
+        }
+    } trap NNTPD {msg} {
+        log "$peer: $msg"
+    } on error {msg} {
+        log "$peer: ERROR $msg\n$::errorInfo"
+    } finally {
+        catch {chan close $sock}
+        upvar #0 stats$sock connstats
+        if {[info exists connstats]} {
+            log "$peer: closed, $connstats"
+            unset connstats
+        }
+    }
+}
+
+proc reply {sock text} {
+    if {[catch {
+        chan puts -nonewline $sock "$text\r\n"
+        chan flush $sock
+    } err]} {
+        throw NNTPD "write failed: $err"
+    }
+}
+
+# Read one line, without its CRLF. Gives up on a line longer than
+# nntpd_max_line, on end of file, and after nntpd_timeout seconds of silence.
+proc readline sock {
+    while 1 {
+        if {[chan gets $sock line] >= 0} {
+            if {[string index $line end] eq "\r"} {
+                set line [string range $line 0 end-1]
+            }
+            return $line
+        }
+        if {[chan eof $sock]} {
+            throw NNTPD "connection closed"
+        }
+        if {[chan pending input $sock] > $::nntpd_max_line} {
+            throw NNTPD "line too long, closing"
+        }
+        set me [info coroutine]
+        chan event $sock readable [list $me readable]
+        set timer [after [expr {$::nntpd_timeout * 1000}] [list $me timeout]]
+        set why [yield]
+        after cancel $timer
+        chan event $sock readable {}
+        if {$why eq "timeout"} {
+            throw NNTPD "timed out, closing"
+        }
+    }
+}
+
+# Read a dot-terminated block, undoing the dot-stuffing. Returns the lines,
+# or an empty list if the block was over nntpd_max_article bytes (the rest of
+# it is read and dropped, so the connection stays usable).
+proc readblock sock {
+    set lines {}
+    set size 0
+    set toobig 0
+    while {[set line [readline $sock]] ne "."} {
+        if {[string index $line 0] eq "."} {
+            set line [string range $line 1 end]
+        }
+        if {$toobig} continue
+        incr size [expr {[string length $line] + 1}]
+        if {$size > $::nntpd_max_article} {
+            set toobig 1
+            set lines {}
+            continue
+        }
+        lappend lines $line
+    }
+    return $lines
+}
+
+proc count {sock what} {
+    upvar #0 stats$sock connstats
+    if {! [info exists connstats]} {
+        set connstats [dict create sent 0 dup 0 rejected 0]
+    }
+    dict incr connstats $what
+}
+
+# ================================= commands ==================================
+
+set commands [dict create \
+    CAPABILITIES cmd_capabilities \
+    DATE         cmd_date \
+    HELP         cmd_help \
+    IHAVE        cmd_ihave \
+    QUIT         cmd_quit \
+]
+
+proc cmd_capabilities {sock argv} {
+    reply $sock "101 Capability list:"
+    reply $sock "VERSION 2"
+    reply $sock "IMPLEMENTATION Newsgrouper nntpd"
+    reply $sock "IHAVE"
+    reply $sock "."
+}
+
+proc cmd_date {sock argv} {
+    reply $sock "111 [clock format [clock seconds] -format %Y%m%d%H%M%S -gmt 1]"
+}
+
+proc cmd_help {sock argv} {
+    reply $sock "100 Commands:"
+    foreach cmd [lsort [dict keys $::commands]] {
+        reply $sock "  $cmd"
+    }
+    reply $sock "."
+}
+
+proc cmd_quit {sock argv} {
+    reply $sock "205 Bye"
+    return quit
+}
+
+# IHAVE <message-id> [anything]
+# mbox2nntp sends a hash of the message-id as a second argument, which is
+# ignored here.
+proc cmd_ihave {sock argv} {
+    lassign $argv msgid
+    if {! [regexp {^<[!-;=?-~]{1,248}>$} $msgid]} {
+        count $sock rejected
+        return [reply $sock "435 Bad message-ID"]
+    }
+    set mid [string range $msgid 1 end-1]
+    if {[archdb exists {SELECT 1 FROM arts WHERE msgid == $mid}]} {
+        count $sock dup
+        return [reply $sock "435 Duplicate"]
+    }
+    reply $sock "335 Send it"
+    set lines [readblock $sock]
+    if {! [llength $lines]} {
+        count $sock rejected
+        return [reply $sock "437 Article too big"]
+    }
+    if {[catch {parse_article $msgid $lines} rec]} {
+        set rec [lindex [split $rec \n] 0]
+        log "rejected $msgid: $rec"
+        count $sock rejected
+        return [reply $sock "437 $rec"]
+    }
+    lassign [store_later $rec] code text
+    switch $code {
+        235 {count $sock sent}
+        435 {count $sock dup}
+        default {count $sock rejected}
+    }
+    reply $sock "$code $text"
+}
+
+# ============================= article parsing ===============================
+
+# Return the header fields wanted for the overview as a dict with lower-case
+# keys. Folded lines are joined, and only the first of repeated fields is kept.
+proc parse_header lines {
+    set hdrs [dict create]
+    set name {}
+    foreach line $lines {
+        if {$line eq {}} break
+        if {[string is space [string index $line 0]]} {
+            if {$name ne {}} {
+                dict append hdrs $name " [string trim $line]"
+            }
+            continue
+        }
+        set name {}
+        if {[regexp {^([!-9;-~]+):[ \t]*(.*)$} $line - field value]} {
+            set field [string tolower $field]
+            if {! [dict exists $hdrs $field]} {
+                set name $field
+                dict set hdrs $name $value
+            }
+        }
+    }
+    return $hdrs
+}
+
+set tzmap {
+	{Pacific Standard Time} PST
+	{Pacific Daylight Time} PDT
+	{Eastern Daylight Time} EDT
+	{Eastern Standard Time} EST
+	{Central (US)} CST
+	PAC PST
+	BRT BT
+	MESZ CEST
+	LOCAL {}
+	ET EST
+	{ et} { EST}
+	{ ct} { CST}
+	{-EDT} { EDT}
+}
+
+# Same workarounds for odd dates as parse_over in newshub, but an article
+# whose date still can't be read is refused rather than dated "now", which
+# would misplace an archived post.
+proc parse_date date {
+    set date [regsub {^[[:alpha:]_.]{3,},} $date {}]
+    set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
+    set date [regsub {\m(\d\d)\.(\d\d)\.(\d\d)\M} $date {\1:\2:\3}]
+    set date [regsub {\m(\d\d): (\d):(\d\d)\M} $date {\1:0\2:\3}]
+    set date [regsub {\mGMT(.\d+)\M} $date {\1}]
+    set date [string map $::tzmap $date]
+    if {[catch {clock scan $date -validate 0} dat]} {
+        #try stripping off an unrecognised timezone
+        set date [regsub {\m(\d\d:\d\d:\d\d)\s.*$} $date {\1}]
+        set date [regsub {\m(\d\d:\d\d)\s+[[:alpha:]/]+$} $date {\1}]
+        #remove extra space before minutes
+        set date [regsub {\m(\d\d): (\d\d:\d\d)\s.*$} $date {\1:\2}]
+        if {[catch {clock scan $date -validate 0} dat]} {
+            error "Unreadable Date header"
+        }
+    }
+    return $dat
+}
+
+# Check an article and return what store_batch needs:
+# msgid (without <>), text, groups, subject, from, date, prev.
+proc parse_article {msgid lines} {
+    set hdrs [parse_header $lines]
+    foreach field {message-id newsgroups date} {
+        if {! [dict exists $hdrs $field]} {
+            error "No [string totitle $field] header"
+        }
+    }
+    if {[string trim [dict get $hdrs message-id]] ne $msgid} {
+        error "Message-ID header does not match"
+    }
+    set dat [parse_date [dict get $hdrs date]]
+
+    set sub [string trim [dict getdef $hdrs subject {}]]
+    catch {set sub [::mime::field_decode $sub]}
+    set from [string trim [dict getdef $hdrs from {}]]
+    catch {set from [::mime::field_decode $from]}
+
+    # The parent is the last References entry, as in newshub, or failing
+    # that the message-id in In-Reply-To.
+    set refs [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} \
+        [dict getdef $hdrs references {}]]
+    set prev [lindex $refs end]
+    if {$prev eq {}} {
+        regexp {<[[:graph:]]+@[[:graph:]]+>} [dict getdef $hdrs in-reply-to {}] prev
+    }
+    set prev [string trim $prev <>]
+
+    set groups {}
+    foreach group [split [dict get $hdrs newsgroups] ,] {
+        set group [string trim $group]
+        if {[regexp {^[[:alnum:]_\-\+]+\.[[:alnum:]_\.\-\+]+$} $group]
+          && $group ni $::blocked_groups && $group ni $groups} {
+            lappend groups $group
+        }
+    }
+    if {! [llength $groups]} {
+        error "No valid group in Newsgroups header"
+    }
+
+    return [dict create msgid [string range $msgid 1 end-1] \
+        text "[join $lines \n]\n" groups $groups sub $sub from $from \
+        dat $dat prev $prev]
+}
+
+# ================================= storage ===================================
+
+# Articles which arrive together are written in one transaction per
+# database. The connection waits for the batch to be written before it
+# replies, so 235 means the article is stored.
+set queue {}
+
+proc store_later rec {
+    lappend ::queue [list [info coroutine] $rec]
+    if {[llength $::queue] == 1} {
+        after idle flush_queue
+    }
+    return [yield]
+}
+
+proc flush_queue {} {
+    set batch $::queue
+    set ::queue {}
+    set recs [lmap item $batch {lindex $item 1}]
+    if {[catch {store_batch $recs} results]} {
+        log "storing failed: $results"
+        set results [lrepeat [llength $batch] {436 {Storing failed, try again later}}]
+    }
+    foreach item $batch result $results {
+        catch {[lindex $item 0] $result}
+    }
+}
+
+proc grpid group {
+    set grpid [overdb onecolumn {SELECT rowid FROM groups WHERE name == $group}]
+    if {$grpid eq {} && $::nntpd_create_groups} {
+        overdb eval {INSERT INTO groups(name) VALUES($group) ON CONFLICT DO NOTHING}
+        set grpid [overdb onecolumn {SELECT rowid FROM groups WHERE name == $group}]
+        log "created group $group ($grpid)"
+    }
+    return $grpid
+}
+
+# The overview rows are written before the text. If storing stops between
+# the two, the article is not yet in arts, so it is offered again, and the
+# rows already written are left alone.
+proc store_batch recs {
+    set results {}
+    overdb transaction {
+        foreach rec $recs {
+            dict with rec {}
+            set grpids {}
+            foreach group $groups {
+                set grpid [grpid $group]
+                if {$grpid ne {}} {lappend grpids $grpid}
+            }
+            if {! [llength $grpids]} {
+                lappend results {437 {No known group}}
+                continue
+            }
+            foreach grpid $grpids {
+                if {[overdb exists {SELECT 1 FROM over
+                                     WHERE grpid == $grpid AND msgid == $msgid}]} {
+                    continue
+                }
+                set xgrpids [lsearch -all -inline -not -exact $grpids $grpid]
+                # Ensure grpid+dat is unique, as in newshub
+                set gdat $dat
+                while {[overdb exists {SELECT 1 FROM over
+                                       WHERE grpid == $grpid AND dat == $gdat}]} {
+                    incr gdat
+                }
+                overdb eval {INSERT INTO over(grpid,sub,frm,dat,msgid,prev,xgrpids)
+                             VALUES($grpid,$sub,$from,$gdat,$msgid,$prev,$xgrpids)
+                             ON CONFLICT DO NOTHING}
+            }
+            lappend results {235 {Article stored}}
+        }
+    }
+    archdb transaction {
+        foreach rec $recs result $results {
+            if {[lindex $result 0] != 235} continue
+            set msgid [dict get $rec msgid]
+            set text [dict get $rec text]
+            archdb eval {INSERT INTO arts(msgid,txt) VALUES($msgid,$text)
+                         ON CONFLICT DO NOTHING}
+        }
+    }
+    return $results
+}
+
+# ================================== start ====================================
+
+socket -server accept -myaddr 127.0.0.1 $nntpd_port
+log "nntpd listening on 127.0.0.1:$nntpd_port"
+vwait forever

@@ -16,3 +16,9 @@ set arch_db /some/path/news_archive.db
 
 # Groups to avoid due to spam, binaries, etc.
 set blocked_groups {some.crap other.crap}
+
+# Parameters for nntpd, the article receiver for archive imports
+# (all optional, these are the defaults)
+#set nntpd_port 1119
+#set nntpd_create_groups 0
+#set nntpd_max_article 2097152

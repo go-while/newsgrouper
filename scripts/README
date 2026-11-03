@@ -1,3 +1,7 @@
 This directory contains library code and utility scripts.
 
 Sample-newsrc.txt is downloaded from https://www.big-8.org/w/images/3/3e/Sample-newsrc.txt
+
+nntpd takes articles by NNTP IHAVE on 127.0.0.1 and stores them like db_load_arch,
+for loading archives with a feeder such as mbox2nntp; see the comment at its top.
+nntpd.test has its tests: tclsh9.0 nntpd.test

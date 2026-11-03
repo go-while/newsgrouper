@@ -1,0 +1,236 @@
+# Tests for nntpd. Run in the scripts directory with:  tclsh9.0 nntpd.test
+# They start nntpd on throwaway databases in a temporary directory, so they
+# touch neither the real databases nor config.tcl.
+
+package require tcltest
+namespace import ::tcltest::*
+package require sqlite3
+
+set nntpd [file normalize [file join [file dirname [info script]] nntpd]]
+set dir [makeDirectory nntpd-test]
+set port [expr {20000 + [pid] % 10000}]
+
+# Same tables as db_create.tcl
+sqlite3 odb $dir/over.db
+sqlite3 adb $dir/arch.db
+odb eval {CREATE TABLE groups(name TEXT PRIMARY KEY, posts INTEGER, servers TEXT, stat TEXT, desc TEXT)}
+odb eval {CREATE TABLE over(grpid INTEGER, sub TEXT, frm TEXT, dat INTEGER, msgid TEXT, prev TEXT, xgrpids TEXT, PRIMARY KEY (grpid,msgid) ON CONFLICT IGNORE)}
+odb eval {CREATE INDEX over_gd ON over(grpid,dat)}
+odb eval {CREATE INDEX over_gp ON over(grpid,prev)}
+adb eval {CREATE TABLE arts(msgid TEXT PRIMARY KEY, txt TEXT)}
+foreach group {comp.lang.tcl comp.lang.misc alt.test} {
+    odb eval {INSERT INTO groups(name) VALUES($group)}
+}
+set grpid(comp.lang.tcl) 1
+set grpid(comp.lang.misc) 2
+
+set cfg [open $dir/config.tcl w]
+puts $cfg [list set over_db $dir/over.db]
+puts $cfg [list set arch_db $dir/arch.db]
+puts $cfg [list set nntpd_port $port]
+puts $cfg [list set nntpd_max_article 4096]
+puts $cfg [list set blocked_groups alt.test]
+close $cfg
+
+set here [pwd]
+cd $dir
+set server [open |[list [info nameofexecutable] $nntpd 2>@1] r]
+cd $here
+gets $server started
+if {! [string match *listening* $started]} {error "nntpd did not start: $started"}
+
+proc connect {} {
+    set s [socket 127.0.0.1 $::port]
+    chan configure $s -translation binary -buffering full
+    set ::greeting [recv $s]
+    return $s
+}
+proc send {s line} {
+    chan puts -nonewline $s "$line\r\n"
+    chan flush $s
+}
+proc recv s {
+    gets $s line
+    return [string trimright $line \r]
+}
+proc code s {lindex [recv $s] 0}
+
+# Offer an article given as a list of lines; return the two reply codes.
+proc offer {s msgid lines {extra {}}} {
+    send $s [string trim "IHAVE $msgid $extra"]
+    set first [code $s]
+    if {$first != 335} {return $first}
+    foreach line $lines {
+        if {[string index $line 0] eq "."} {set line .$line}
+        send $s $line
+    }
+    send $s .
+    return [list $first [code $s]]
+}
+proc article {msgid args} {
+    set hdrs [dict merge [dict create \
+        From {A Poster <a@example.com>} \
+        Newsgroups comp.lang.tcl \
+        Subject {A subject} \
+        Date {Mon, 06 Mar 1995 12:00:00 GMT} \
+        Message-ID $msgid] [lindex $args 0]]
+    set lines {}
+    dict for {k v} $hdrs {
+        if {$v ne {}} {lappend lines "$k: $v"}
+    }
+    lappend lines {} {Body line one.} {Body line two.}
+    if {[llength $args] > 1} {set lines [lreplace $lines end-1 end {*}[lindex $args 1]]}
+    return $lines
+}
+
+set c [connect]
+
+test greeting-1 {greeting says transit only} {
+    lindex $greeting 0
+} 201
+
+test capabilities-1 {CAPABILITIES lists IHAVE} {
+    send $c CAPABILITIES
+    set out {}
+    while {[set l [recv $c]] ne "."} {lappend out $l}
+    list [lindex $out 0 0] [expr {"IHAVE" in $out}]
+} {101 1}
+
+test mode-reader-1 {MODE READER is refused for now} {
+    send $c "MODE READER"
+    code $c
+} 502
+
+test ihave-1.1 {a new article is stored} {
+    set art [article <one@example.com> {References {<p0@example.com> <p1@example.com>}}]
+    set r [offer $c <one@example.com> $art]
+    list $r \
+        [adb eval {SELECT txt FROM arts WHERE msgid = 'one@example.com'}] \
+        [odb eval {SELECT grpid,sub,frm,dat,prev,xgrpids FROM over WHERE msgid = 'one@example.com'}]
+} [list {335 235} [list "[join [article <one@example.com> {References {<p0@example.com> <p1@example.com>}}] \n]\n"] \
+    [list 1 {A subject} {A Poster <a@example.com>} [clock scan {Mon, 06 Mar 1995 12:00:00 GMT}] p1@example.com {}]]
+
+test ihave-1.2 {the same article again is a duplicate} {
+    offer $c <one@example.com> [article <one@example.com>]
+} 435
+
+test ihave-1.4 {header names are matched in any case} {
+    set art [lmap l [article <case@example.com>] {regsub {^Message-ID:} $l {Message-id:}}]
+    list [offer $c <case@example.com> $art] \
+        [odb eval {SELECT count(*) FROM over WHERE msgid = 'case@example.com'}]
+} {{335 235} 1}
+
+test ihave-1.5 {subject and from are trimmed for the overview} {
+    offer $c <trim@example.com> [article <trim@example.com> {Subject {Spaces after   } From {B <b@example.com>  }}]
+    odb eval {SELECT sub,frm FROM over WHERE msgid = 'trim@example.com'}
+} {{Spaces after} {B <b@example.com>}}
+
+test ihave-1.3 {a second argument to IHAVE is ignored} {
+    offer $c <two@example.com> [article <two@example.com>] 0123abcd
+} {335 235}
+
+test ihave-2.1 {a malformed message-id is not wanted} {
+    offer $c no-brackets@example.com [article no-brackets@example.com]
+} 435
+
+test ihave-2.2 {Message-ID header must match the offer} {
+    offer $c <three@example.com> [article <other@example.com>]
+} {335 437}
+
+test ihave-2.3 {an article without Date is refused} {
+    offer $c <four@example.com> [article <four@example.com> {Date {}}]
+} {335 437}
+
+test ihave-2.4 {an unreadable Date is refused} {
+    offer $c <five@example.com> [article <five@example.com> {Date {not a date at all}}]
+} {335 437}
+
+test ihave-2.5 {an article with no known group is refused and not stored} {
+    list [offer $c <six@example.com> [article <six@example.com> {Newsgroups no.such.group}]] \
+        [adb eval {SELECT count(*) FROM arts WHERE msgid = 'six@example.com'}]
+} {{335 437} 0}
+
+test ihave-2.6 {a blocked group counts as unknown} {
+    offer $c <seven@example.com> [article <seven@example.com> {Newsgroups alt.test}]
+} {335 437}
+
+test ihave-3.1 {cross-posts get one row per known group, with xgrpids} {
+    offer $c <x@example.com> [article <x@example.com> {Newsgroups {comp.lang.tcl, no.such.group,comp.lang.misc}}]
+    odb eval {SELECT grpid,xgrpids FROM over WHERE msgid = 'x@example.com' ORDER BY grpid}
+} {1 2 2 1}
+
+test ihave-3.2 {dat is made unique within a group} {
+    set d {Tue, 07 Mar 1995 08:00:00 GMT}
+    offer $c <d1@example.com> [article <d1@example.com> [list Date $d]]
+    offer $c <d2@example.com> [article <d2@example.com> [list Date $d]]
+    set t [clock scan $d]
+    odb eval {SELECT dat - $t FROM over WHERE msgid IN ('d1@example.com','d2@example.com') ORDER BY dat}
+} {0 1}
+
+test ihave-3.3 {In-Reply-To is used when there are no References} {
+    offer $c <r@example.com> [article <r@example.com> {In-Reply-To {<parent@example.com> from someone}}]
+    odb eval {SELECT prev FROM over WHERE msgid = 'r@example.com'}
+} parent@example.com
+
+test ihave-3.4 {encoded-word subjects are decoded for the overview} {
+    offer $c <q@example.com> [article <q@example.com> {Subject {=?ISO-8859-1?Q?Gr=FC=DFe?=}}]
+    odb eval {SELECT sub FROM over WHERE msgid = 'q@example.com'}
+} "Gr\u00fc\u00dfe"
+
+test ihave-4.1 {dot-stuffing is undone} {
+    offer $c <dot@example.com> [article <dot@example.com> {} {{.leading dot} ..two}]
+    lrange [split [adb onecolumn {SELECT txt FROM arts WHERE msgid = 'dot@example.com'}] \n] end-2 end-1
+} {{.leading dot} ..two}
+
+test ihave-4.2 {8-bit bytes are stored unchanged} {
+    set raw "Gr[format %c 0xc3][format %c 0xbc]sse"
+    offer $c <bin@example.com> [article <bin@example.com> {} [list $raw]]
+    set txt [adb onecolumn {SELECT txt FROM arts WHERE msgid = 'bin@example.com'}]
+    expr {[lindex [split $txt \n] end-1] eq $raw}
+} 1
+
+test ihave-4.3 {an oversized article is refused and the connection still works} {
+    set big [lrepeat 100 [string repeat x 70]]
+    list [offer $c <big@example.com> [article <big@example.com> {} $big]] \
+        [adb eval {SELECT count(*) FROM arts WHERE msgid = 'big@example.com'}] \
+        [offer $c <after@example.com> [article <after@example.com>]]
+} {{335 437} 0 {335 235}}
+
+test parallel-1 {articles from several connections are all stored} {
+    set conns {}
+    for {set i 0} {$i < 4} {incr i} {lappend conns [connect]}
+    # send all offers first, then read the replies
+    set n 0
+    foreach s $conns {
+        send $s "IHAVE <par$n@example.com>"
+        incr n
+    }
+    foreach s $conns {code $s}
+    set n 0
+    foreach s $conns {
+        foreach line [article <par$n@example.com>] {send $s $line}
+        send $s .
+        incr n
+    }
+    set codes [lmap s $conns {code $s}]
+    foreach s $conns {send $s QUIT; recv $s; close $s}
+    list $codes [adb eval {SELECT count(*) FROM arts WHERE msgid LIKE 'par%'}]
+} {{235 235 235 235} 4}
+
+test unknown-1 {unknown commands get 500} {
+    send $c "POST"
+    code $c
+} 500
+
+test quit-1 {QUIT says goodbye} {
+    send $c QUIT
+    code $c
+} 205
+
+close $c
+exec kill [pid $server]
+catch {close $server}
+odb close
+adb close
+removeDirectory nntpd-test
+cleanupTests
