@@ -7,8 +7,10 @@ proc putd s {puts $s}
 set nntp_port 119
 lassign $argv service debug
 source ${service}_config.tcl
-source retcl.tm
+source retcl-0.7.1.tm
 source distcl.tcl
+
+#::tcl::tm::path add .
 
 package require retcl
 retcl create redis

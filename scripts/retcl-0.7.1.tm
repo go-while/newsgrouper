@@ -1,5 +1,5 @@
 ##
-# Copyright (C) 2014-2017 Pietro Cerutti <gahr@gahr.ch>
+# Copyright (C) 2014-2026 Pietro Cerutti <gahr@gahr.ch>
 # 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -28,7 +28,7 @@
 package require Tcl 8.6 9.0
 package require TclOO
 
-package provide retcl 0.4.0
+package provide retcl 0.7.1
 
 catch {retcl destroy}
 
@@ -41,6 +41,10 @@ namespace eval ::retcl {
     ##
     # Default Redis endpoint port
     variable defaultPort 6379
+
+    ##
+    # Prefix for command ids
+    variable cmdIdPrefix "rds:"
 
     ##
     # Mapping of RESP data types to symbolic names.
@@ -101,6 +105,22 @@ oo::class create retcl {
     variable async
 
     ##
+    # This variable contains the arguments passed to the +tls method, or 0 if
+    # TLS is disabled. TLS requires the tcltls extension available at
+    # https://core.tcl-lang.org/tcltls.
+    variable tls
+
+    ##
+    # Boolean to indicate whether data to be sent to Redis is checked for
+    # characters above 0xFF. The socket is binary, so non-binary strings will
+    # cause a write error and leave the socket in an inconsistent state,
+    # forcing us to close the connection.
+    # This flag forces a check and triggers an error earlier, before the data
+    # hits the socket, which might be more desirable than closing the
+    # connection.
+    variable binaryCheck
+
+    ##
     # An incremental integer to track requests / responses.
     variable cmdIdNumber
 
@@ -148,6 +168,8 @@ oo::class create retcl {
         set resultsCache [dict create]
         set keepCache 1
         set async 1
+        set tls 0
+        set binaryCheck 0
         set cmdIdNumber 0
         set host $::retcl::defaultHost
         set port $::retcl::defaultPort
@@ -160,7 +182,28 @@ oo::class create retcl {
         set reconnectEventId {}
         set activity 0
 
-        switch [llength $args] {
+        set optRegex {^[+-]}
+        # gather all methods that can be used as options
+        set methods [lsort [lmap m [info object methods [self object] -all] {
+            if {![regexp $optRegex $m]} {
+                continue
+            }
+            set m
+        }]]
+        
+        # apply all options and re-gather non-option arguments
+        set args [lmap a $args {
+            set opt [lindex $a 0]
+            if {$opt in $methods} {
+                my $opt {*}[lrange $a 1 end]
+                continue
+            } elseif {[regexp $optRegex $a] && $a ne {-noconnect}} {
+                my Error "bad option \"$opt\": must be any of -noconnect $methods"
+            }
+            set a
+        }]
+
+        switch -- [llength $args] {
             0 {
                 # connect to default host and port
                 my connect
@@ -202,7 +245,16 @@ oo::class create retcl {
             set port $a_port
         }
 
-        if {[catch {socket $host $port} res]} {
+        if {$tls ne {0}} {
+            if {[catch {package require tls} res]} {
+                my Error "Cannot load TLS extension: $res"
+            }
+            set socket_cmd [concat tls::socket [expr {$tls eq {1} ? "" : $tls}]]
+        } else {
+            set socket_cmd [list socket]
+
+        }
+        if {[catch {{*}$socket_cmd $host $port} res]} {
             my Error "Cannot connect: $res"
         }
 
@@ -258,6 +310,7 @@ oo::class create retcl {
         set sock {}
         after cancel $checkEventId
         after cancel $reconnectEventId
+        my clearResult pending
     }
 
     ##
@@ -275,11 +328,34 @@ oo::class create retcl {
     export -async
 
     ##
-    # Query the currenct asynchronous operation mode.
+    # Query the current asynchronous operation mode.
     method ?async {} {
         set async
     }
     export ?async
+
+    ##
+    # Turn on TLS connections. If args is specified, it will be passed to
+    # tls::socket on connection.
+    method +tls {{args 1}} {
+        set tls $args
+        return 1
+    }
+    export +tls
+
+    ##
+    # Turn off TLS connections.
+    method -tls {} {
+        set tls 0
+    }
+    export -tls
+
+    ##
+    # Query the current TLS connection mode.
+    method ?tls {} {
+        expr {$tls ne {0}}
+    }
+    export ?tls
 
     ##
     # Turn on keeping results in the cache.
@@ -303,6 +379,27 @@ oo::class create retcl {
     export ?keepCache
 
     ##
+    # Turn on binary checks.
+    method +binaryCheck {} {
+        set binaryCheck 1
+    }
+    export +binaryCheck
+
+    ##
+    # Turn off binary checks.
+    method -binaryCheck {} {
+        set binaryCheck 0
+    }
+    export -binaryCheck
+
+    ##
+    # Query the current binary check mode.
+    method ?binaryCheck {} {
+        set binaryCheck
+    }
+    export ?binaryCheck
+
+    ##
     # Setup and error callback or restore the default one ([error]). The
     # cmdPrefix is passed an additional argument containing the error message.
     method errorHandler {{cmdPrefix {}}} {
@@ -319,7 +416,7 @@ oo::class create retcl {
     # string if -async is given.
     method result {args} {
 
-        switch [llength $args] {
+        switch -- [llength $args] {
             1 {
                 set asyncArg 0
                 set cmdId $args
@@ -401,16 +498,23 @@ oo::class create retcl {
     ##
     # Clear results from the cache.
     method clearResult {{clearCmdId {}}} {
-
-        if {$clearCmdId eq {}} {
-            set resultsCache [dict filter $resultsCache script {cmdId _} {
-                expr {![dict get $resultsCache $cmdId status]}
-            }]
-        } else {
-            set resultsCache [dict filter $resultsCache script {cmdId _} {
-                expr {$clearCmdId ne $cmdId ||
-                      ![dict get $resultsCache $cmdId status]}
-            }]
+        switch -glob -- $clearCmdId {
+            {} {
+                set resultsCache [dict filter $resultsCache script {cmdId _} {
+                    expr {![dict get $resultsCache $cmdId status]}
+                }]
+            }
+            pending {
+                set resultsCache [dict filter $resultsCache script {cmdId _} {
+                    dict get $resultsCache $cmdId status
+                }]
+            }
+            default {
+                set resultsCache [dict filter $resultsCache script {cmdId _} {
+                    expr {$clearCmdId ne $cmdId ||
+                          ![dict get $resultsCache $cmdId status]}
+                }]
+            }
         }
         return {}
     }
@@ -419,13 +523,19 @@ oo::class create retcl {
     # Execute all Redis commands inside a script within a single pipeline.
     method pipeline {script} {
 
+        if {!$async} {
+            my Error "pipelining is only supported in async mode"
+        }
+
         my LockPipeline
         try {
             uplevel [list eval $script]
         } on error msg {
             my Error $msg
         } finally {
-            my ReleasePipeline
+            if {[catch {my ReleasePipeline} err]} {
+                my Error $err
+            }
         }
     }
 
@@ -467,6 +577,9 @@ oo::class create retcl {
 
         switch [lindex $args 0] {
             {-sync} {
+                if {$isPipelined} {
+                    my Error "sync mode is not supported in a pipeline"
+                }
                 # Send synchronously and return the result, when available
                 set sendAsync 0
                 set args [lrange $args 1 end]
@@ -482,17 +595,19 @@ oo::class create retcl {
             return
         }
 
+        if {[catch {my Send $args} err]} {
+            my Error $err
+        }
+
         if {[string tolower [lindex $args 0]] in $::retcl::pubSubCommands} {
             # These messages are part of the Pub/Sub protocol; we don't expect
             # a response.
             set cmdId {}
         } else {
-            set cmdId "rds:[incr cmdIdNumber]"
+            set cmdId "$::retcl::cmdIdPrefix[incr cmdIdNumber]"
             dict set resultsCache $cmdId status 0
             dict set resultsCache $cmdId callback $callback
         }
-
-        my Send $args
 
         if {$sendAsync || $callback ne {} || $cmdId eq {}} {
             # Asynchronous send, return the command identifier
@@ -532,7 +647,9 @@ oo::class create retcl {
             }
 
             lassign $result idx type data
-            my HandleResult $type $data
+            if {[catch {my HandleResult $type $data} err]} {
+                my Error $err
+            }
         }
 
         if {$idx != 0} {
@@ -677,7 +794,7 @@ oo::class create retcl {
             try {
                 dict get $callbacks $pattern
             } on ok callback {
-                namespace eval :: $callback $type $pattern $item $data
+                namespace eval :: [list {*}$callback $type $pattern $item $data]
             } finally {
                 # It's a subscribe / unsubscribe. Clear the corresponding
                 # request, if any.
@@ -693,7 +810,7 @@ oo::class create retcl {
         set cmdIds [my FindPendingRequest]
         if {$cmdIds eq {}} {
             # All requests already have a response, something went bad
-            my Error "No request found for response $body"
+            error "No request found for response $body"
         }
         set cmdId [lindex $cmdIds 0]
         set cb [dict get $resultsCache $cmdId callback]
@@ -711,7 +828,7 @@ oo::class create retcl {
     # Get a return type string by its byte.
     method TypeName {byte} {
         if {[catch {dict get $::retcl::typeNames $byte} name]} {
-            my Error "Invalid type byte: $byte"
+            error "Invalid type byte: $byte"
         }
         set name
     }
@@ -721,6 +838,9 @@ oo::class create retcl {
     method BuildResp {args} {
         set msg "*[llength $args]\r\n"
         foreach word $args {
+            if {$binaryCheck && [regexp {[^\x00-\xff]} $word]} {
+                error "non-binary data detected"
+            }
             append msg "\$[string length $word]\r\n$word\r\n"
         }
         set msg
@@ -731,7 +851,7 @@ oo::class create retcl {
     # argument is a list of words composing the command.
     method Send {args} {
         if {[llength $args] > 1} {
-            my Error "Too many args: $args"
+            error "Too many args: $args"
         }
         foreach cmd $args {
             append pipeline "[my BuildResp {*}$cmd]\r\n"
@@ -740,73 +860,6 @@ oo::class create retcl {
         if {!$isPipelined} {
             my Flush
         }
-    }
-
-    ## 
-    # Return a list of responses from the server. A maximum number
-    # of results might be specified. This is mostly used internally
-    # to recursively call [my Recv] to receive Array elements.
-    method Recv {{includeTypes 1} {maxResults -1}} {
-        if {$maxResults == 0} {
-            return
-        }
-
-        set result [list]
-
-        while {[gets $sock line] > 0} {
-            set respCode [string index $line 0]
-            set respName [my TypeName $respCode]
-            set respData [string range $line 1 end]
-
-            switch $respCode {
-                + -
-                - -
-                : {
-                    # Simple Strings, Errors, and Integers are handled
-                    # straight forward
-                    if {$includeTypes} {
-                        lappend result [list $respName $respData]
-                    } else {
-                        lappend result $respData
-                    }
-                }
-                $ {
-                    # Bulk Strings, read the number of char specified in the
-                    # first line.
-                    # If it's -1, it's a (nil).
-                    if {$respData eq {-1}} {
-                        if {$includeTypes} {
-                            lappend result [list BulkString (nil)]
-                        } else {
-                            lappend result (nil)
-                        }
-                    } else {
-                        set bulk [read $sock $respData]
-                        if {$includeTypes} {
-                            lappend result [list $respName $bulk]
-                        } else {
-                            lappend result $bulk
-                        }
-                        gets $sock ;# consume the final end of line
-                    }
-                }
-                * {
-                    # Arrays, call [my Recv] recursively to get the number of
-                    # elements
-                    if {$includeTypes} {
-                        lappend result [list Array [my Recv 0 $respData]]
-                    } else {
-                        lappend result [my Recv 0 $respData]
-                    }
-                }
-            }
-
-            if {$maxResults != -1 && [incr maxResults -1] == 0} {
-                break
-            }
-        }
-
-        set result
     }
 
     ##
@@ -845,16 +898,23 @@ oo::class create retcl {
     ##
     # Flush the output buffer
     method Flush {} {
-        if {![my connected]} {
-            my Error {Disconnected}
-        }
-        if {[catch {puts -nonewline $sock $pipeline} err]} {
-            my Error $err
-        }
-        chan flush $sock
-
+        set buf $pipeline
         set isPipelined 0
         set pipeline [list]
+
+        if {![my connected]} {
+            # nothing can answer the commands still waiting for a result:
+            # they were queued while disconnected and are dropped with the
+            # buffer
+            my clearResult pending
+            error Disconnected
+        }
+
+        if {[catch {puts -nonewline $sock $buf} err]} {
+            my disconnect
+            error $err
+        }
+        chan flush $sock
     }
 
     ##

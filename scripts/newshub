@@ -3,7 +3,7 @@
 # NewsHub - Aggregate, store and supply news data from multiple sources.
 
 source config.tcl
-source retcl.tm
+source retcl-0.7.1.tm
 source distcl.tcl
 package require mime
 

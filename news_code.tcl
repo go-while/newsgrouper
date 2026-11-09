@@ -242,6 +242,10 @@ proc dispatch_action {urec sock suffix} {
 # Request specifies a group, process the rest of it.
 proc dispatch_group {urec sock group rest} {
     lassign $urec user can_post params
+    if {! $can_post && [bot_check $urec $group $rest]} {
+        tailcall make_captcha $sock $urec $group$rest
+    }
+
     if {! [dict exists $::Groupstats $group] && $group ne "all.all"} {
         set rest { not found}
     }
@@ -256,7 +260,6 @@ proc dispatch_group {urec sock group rest} {
         html [show_thread $urec $group $start $num 0] }
     {^/(\d+)/raw$} {
         lassign $num_etc - num
-        if {! $can_post} {bot_check $urec $num}
         tailcall show_article_raw $sock $group $num }
     {^/(\d+)/post$} {
         lassign $num_etc - num
@@ -552,15 +555,21 @@ proc get_user_record sock {
 }
 
 # Guest users pulling old posts may be AI trawlers.
-# Give them a captcha 20% of the time, this will appear on their next request.
-set bot_check_dat [clock scan {1/1/2023}]
-proc bot_check {urec dat} {
-    if {$dat > $::bot_check_dat} return
-    set rand [::tcl::mathfunc::rand]
-    if {$rand > 0.2} return
+# Return whether to give them a captcha.
+# This will happen on their first attempt, and 20% of the time thereafter.
+# If captcha has been solved for a page, allow the page on next attempt.
+set bot_check_newest [clock scan {1/1/2023}]
+set bot_check_oldest [clock scan {1/1/1980}]
+proc bot_check {urec group rest} {
     lassign $urec user can_post params
-    dict set params captcha $rand
-    userdb eval {UPDATE users SET params = $params WHERE num = $user}
+#printvars bot_check user rest params
+
+    if {! [regexp {\d+} $rest dat]} {return 0}
+    if {$dat > $::bot_check_newest} {return 0}
+    if {$dat < $::bot_check_oldest} {return 0}
+    if {! [dict exists $params capok]} {return 1}
+    if {[dict get $params capok] eq "$group$rest"} {return 0}
+    return [expr {rand() < 0.2}]
 }
 
 proc check_captcha {sock urec suffix} {
@@ -569,13 +578,19 @@ proc check_captcha {sock urec suffix} {
     set cap_supplied [$sock getFormdata captcha]
 printvars user cap_expected cap_supplied
 
-    if {$cap_supplied == $cap_expected} {
-        dict unset params captcha
-        userdb eval {UPDATE users SET params = $params WHERE num = $user}
-        $sock redirect [local_url $suffix]
-        return
+    if {$cap_supplied != $cap_expected} {
+        tailcall make_captcha $sock $urec $suffix
     }
+    dict unset params captcha
+    dict set params capok $suffix
+    userdb eval {UPDATE users SET params = $params WHERE num = $user}
+    $sock redirect [local_url $suffix]
+}
+
+proc make_captcha {sock urec suffix} {
+    lassign $urec user can_post params
     coroutine::util after 2000
+
     # Bot defense - generate a 'captcha' question and answer
     lassign [captcha] cap_question cap_answer
     dict set params captcha $cap_answer
@@ -1112,7 +1127,6 @@ proc show_thread {urec group start target insearch} {
 
     # Show the thread structure and posters for this discussion thread
     lassign $urec user can_post params ugrps
-    if {! $can_post} {bot_check $urec $start}
     set fail {<h3>Thread not found</h3>}
 
     # get the block of headers containing the thread start
@@ -1591,7 +1605,7 @@ proc markup_art_line {markup line} {
     # Token types are url, news-msgid, begin-emphasis, end-emphasis.
     set url_re {([[:alnum:]\-+]+://[[:alnum:]\-;,/?:@&=+$_.!~*()#%]+)}
     set news_re {(<[[:graph:]]+@[[:alnum:]\-\.]+>)}
-    set begin_emp_re {(?:(?:\A|\s|[[:punct:]])([*/_]+)[[:alnum:]])}
+    set begin_emp_re {(?:(?:\A|\s|[[:punct:]])([*/_]+)(?=[[:alnum:]]))}
     set end_emp_re {(?:[[:alnum:]]([*/_]+)(?:\Z|\s|[[:punct:]]))}
     set re "$url_re|$news_re"
     set matches {all url news}
