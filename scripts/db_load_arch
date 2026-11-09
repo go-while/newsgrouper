@@ -128,7 +128,7 @@ proc parse_art art {
     set headers [::mime::getheader $mt]
     ::mime::finalize $mt
  
-    set date [dict_getdef $headers Date {}]
+    set date [getheader $headers Date]
     # hacks for weird date formats
     set date [regsub {^[[:alpha:]]{3,},} $date {}]
     set date [regsub {\m(\d\d\d\d)/(\d\d)/(\d\d)\M} $date {\2/\3/\1}]
@@ -146,16 +146,16 @@ proc parse_art art {
     }
     #if {$dat > $::max_dat} return
 
-    set sub [dict_get_2 $headers Subject SUBJECT]
+    set sub [getheader $headers Subject]
     catch {set sub [::mime::field_decode $sub]}
-    set from [dict_get_2 $headers From FROM]
+    set from [getheader $headers From]
     catch {set from [::mime::field_decode $from]}
-    set msgid [dict_get_2 $headers Message-ID Message-Id]
+    set msgid [getheader $headers Message-ID]
     #set msgid [string trim $msgid <>]
     regexp {<([^>]+)>} $msgid - msgid
-    set prev [dict_getdef $headers In-Reply-To {}]
+    set prev [getheader $headers In-Reply-To]
     if {$prev eq {}} {
-        set refs [dict_getdef $headers References {}]
+        set refs [getheader $headers References]
         set reflist [regexp -all -inline {<[[:graph:]]+@[[:graph:]]+>} $refs]
         set prev [lindex $reflist end]
     }
@@ -192,11 +192,15 @@ proc dict_getdef {dict key def} {
     return $def
 }
 
-proc dict_get_2 {dict key1 key2} {
-    if {[dict exists $dict $key1]} {
-        return [dict get $dict $key1]
+# Header names are case-insensitive: old archives have "Message-id:",
+# "In-reply-to:" and the like.
+proc getheader {headers name} {
+    dict for {key value} $headers {
+        if {[string equal -nocase $key $name]} {
+            return $value
+        }
     }
-    return [dict_getdef $dict $key2 {}]
+    return {}
 }
 
 proc load_file infile {
